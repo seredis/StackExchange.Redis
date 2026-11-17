@@ -77,6 +77,7 @@ internal partial class PhysicalConnection
     {
         if (stream is null) return;
         _ioStream = stream;
+        _streamAdopted = true;
         var config = BridgeCouldBeNull?.Multiplexer?.RawConfig;
 
         var mode = ResolveWriteMode(connectionType, WriteMode, ConnectionMultiplexer.DedicatedThreads);

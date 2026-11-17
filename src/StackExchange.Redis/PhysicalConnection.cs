@@ -194,6 +194,11 @@ namespace StackExchange.Redis
         /// </summary>
         private Stream? _ioStream;
 
+        // Set when a stream is adopted (InitOutput) and never cleared, mirroring _transportAdopted:
+        // Shutdown nulls _ioStream, and RecordConnectionFailed needs to know a stream existed to
+        // attribute the failure.
+        private bool _streamAdopted;
+
         private Socket? _socket;
         internal Socket? VolatileSocket => Volatile.Read(ref _socket);
 
@@ -484,6 +489,7 @@ namespace StackExchange.Redis
             var output = Interlocked.Exchange(ref _output, null); // compare to the critical read
             var socket = Interlocked.Exchange(ref _socket, null);
             var transport = Interlocked.Exchange(ref _transport, null);
+            var ioStream = Interlocked.Exchange(ref _ioStream, null);
 
             if (output != null)
             {
@@ -502,6 +508,16 @@ namespace StackExchange.Redis
             if (transport != null)
             {
                 try { transport.DisposeAsync().AsTask().RedisFireAndForget(); } catch { }
+            }
+
+            // A socketless tunnel stream (GetSocketConnectEndpointAsync -> null, BeforeAuthenticateAsync
+            // -> Stream) has no socket whose disposal tears it down: the stream IS the connection, so it
+            // must be disposed here or the tunnel's transport leaks. For socket-backed streams this is
+            // belt-and-braces beside the socket disposal above. _streamAdopted stays true for failure
+            // attribution; the read loops observe the null as EOF (Stream.Null).
+            if (ioStream != null)
+            {
+                try { ioStream.Dispose(); } catch { }
             }
         }
 
@@ -568,7 +584,7 @@ namespace StackExchange.Redis
             var bridge = BridgeCouldBeNull;
             Message? nextMessage;
 
-            if (_ioStream is not null || _transportAdopted || isInitialConnect) // if *we* didn't burn the pipe: flag it
+            if (_streamAdopted || _transportAdopted || isInitialConnect) // if *we* didn't burn the pipe: flag it
             {
                 if (failureType == ConnectionFailureType.InternalFailure && innerException is not null)
                 {
