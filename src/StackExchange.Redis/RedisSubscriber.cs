@@ -261,9 +261,10 @@ namespace StackExchange.Redis
                 if (serverEndPoint.IsSubscriberConnected)
                 {
                     // we'll *try* for a simple resubscribe, following any -MOVED etc, but if that fails: fall back
-                    // to full reconfigure; importantly, note that we've already recorded the disconnect
-                    var message = sub.GetSubscriptionMessage(channel, SubscriptionAction.Subscribe, CommandFlags.None, false);
-                    _ = ExecuteAsync(message, sub.Processor, serverEndPoint).ContinueWith(
+                    // to full reconfigure; importantly, note that we've already recorded the disconnect; this goes
+                    // via the ensure path so that it participates in the pending-claim handshake - a restore that
+                    // bypassed it could still race an overlapping restore onto a second server (#3336)
+                    _ = sub.EnsureSubscribedToServerAsync(this, channel, CommandFlags.None, false, serverEndPoint).ContinueWith(
                         t => multiplexer.ReconfigureIfNeeded(serverEndPoint.EndPoint, false, cause: cause),
                         TaskContinuationOptions.OnlyOnFaulted);
                 }
