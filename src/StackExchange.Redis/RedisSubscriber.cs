@@ -32,12 +32,118 @@ namespace StackExchange.Redis
                 return sub;
             }
         }
+
+        /// <summary>
+        /// Adds a handler and/or queue to the channel's subscription, creating one if there is none; never to one that
+        /// is being retired by a concurrent unsubscribe, see <see cref="Subscription.RegistrationLock"/>.
+        /// </summary>
+        internal Subscription AddToSubscription(in RedisChannel channel, CommandFlags flags, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
+        {
+            while (true)
+            {
+                var sub = GetOrAddSubscription(channel, flags);
+                if (sub.TryAdd(handler, queue)) return sub;
+
+                // it was retired (and so removed) concurrently; looking it up again yields a fresh one
+            }
+        }
+
         internal bool TryGetSubscription(in RedisChannel channel, [NotNullWhen(true)] out Subscription? sub) => subscriptions.TryGetValue(channel, out sub);
         internal bool TryRemoveSubscription(in RedisChannel channel, [NotNullWhen(true)] out Subscription? sub)
         {
             lock (subscriptions)
             {
                 return subscriptions.TryRemove(channel, out sub);
+            }
+        }
+
+        private static readonly TimeSpan UnsubscribeRetryInitialDelay = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan UnsubscribeRetryMaxDelay = TimeSpan.FromSeconds(5);
+        private const int UnsubscribeRetryMaxAttempts = 30;
+
+        /// <summary>
+        /// Retiring a subscription removes it from the multiplexer whether or not the server-side unsubscribe succeeds. When
+        /// the server never ran that unsubscribe (e.g. it replied <c>BUSY</c>), it is still subscribed, and would keep pushing
+        /// messages that nothing receives, with nothing left on the client to unsubscribe; so this re-issues the unsubscribe,
+        /// after a backoff, unless the channel has been subscribed to again by then (at which point client and server agree
+        /// once more). It is called for each such failure - including those of the re-issued unsubscribes - from wherever the
+        /// failure is observed: <see cref="ResultProcessor.TrackSubscriptionsProcessor"/> for error replies (whether or not
+        /// anyone awaits the command, e.g. <see cref="CommandFlags.FireAndForget"/>), and <see cref="ObserveUnsubscribe"/>
+        /// for failures with no reply at all (the command never having been written).
+        /// </summary>
+        internal void OnUnsubscribeNotApplied(in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            var attempt = retired.RecordDeclinedUnsubscribe();
+            if (attempt > UnsubscribeRetryMaxAttempts) return;
+
+            var delay = TimeSpan.FromTicks(Math.Min(
+                UnsubscribeRetryInitialDelay.Ticks << Math.Min(attempt - 1, 16),
+                UnsubscribeRetryMaxDelay.Ticks));
+            _ = RetryUnsubscribeAsync(channel, retired, flags & Message.UserSelectableFlags, delay);
+        }
+
+        private async Task RetryUnsubscribeAsync(RedisChannel channel, Subscription retired, CommandFlags flags, TimeSpan delay)
+        {
+            try
+            {
+                await Task.Delay(delay).ForAwait();
+                if (_isDisposed) return;
+
+                var subscriber = (RedisSubscriber)GetSubscriber();
+                // only while the channel has no subscription again, and in order with any that's added afterwards; see
+                // TryIssueWhileUnsubscribed (otherwise, this could undo a subscription newer than the retired one)
+                if (TryIssueWhileUnsubscribed(channel, () => retired.UnsubscribeFromServerAsync(subscriber, channel, flags, null, true), out var unsubscribe))
+                {
+                    ObserveUnsubscribe(unsubscribe, channel, retired, flags);
+                }
+            }
+            catch
+            {
+                // e.g. the multiplexer was disposed meanwhile; nothing more to do
+            }
+        }
+
+        /// <summary>
+        /// Observes the outcome of a retired subscription's unsubscribe, to retry it if it was never written (so the server
+        /// never saw it); a failure the server replied with is left to <see cref="ResultProcessor.TrackSubscriptionsProcessor"/>,
+        /// which sees every reply, rather than only those of awaited commands.
+        /// </summary>
+        internal void ObserveUnsubscribe(Task unsubscribe, in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            if (unsubscribe.Status is TaskStatus.RanToCompletion) return;
+
+            var observedChannel = channel;
+            _ = unsubscribe.ContinueWith(
+                t =>
+                {
+                    if (t.Exception?.InnerException is { } fault) OnUnsubscribeFailed(fault, observedChannel, retired, flags);
+                },
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        }
+
+        internal void OnUnsubscribeFailed(Exception fault, in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            if (fault is RedisServerException) return; // a reply; see TrackSubscriptionsProcessor
+            if (new Availability.FaultContext(fault).NotApplied) OnUnsubscribeNotApplied(channel, retired, flags);
+        }
+
+        /// <summary>
+        /// Issues a command via <paramref name="issue"/>, unless <paramref name="channel"/> has a subscription; holding the
+        /// same lock as <see cref="GetOrAddSubscription"/>, so that a subscription added afterwards has its subscribe command
+        /// issued after this one.
+        /// </summary>
+        /// <returns><see langword="true"/> if the command was issued, <see langword="false"/> if the channel has a subscription.</returns>
+        internal bool TryIssueWhileUnsubscribed(in RedisChannel channel, Func<Task<bool>> issue, [NotNullWhen(true)] out Task<bool>? issued)
+        {
+            lock (subscriptions)
+            {
+                if (subscriptions.ContainsKey(channel))
+                {
+                    issued = null;
+                    return false;
+                }
+                issued = issue();
+                return true;
             }
         }
 
@@ -248,8 +354,7 @@ namespace StackExchange.Redis
             ThrowIfNull(channel);
             if (handler == null && queue == null) { return 0; }
 
-            var sub = multiplexer.GetOrAddSubscription(channel, flags);
-            sub.Add(handler, queue);
+            var sub = multiplexer.AddToSubscription(channel, flags, handler, queue);
             return sub.EnsureSubscribedToServer(this, channel, flags, false);
         }
 
@@ -291,8 +396,7 @@ namespace StackExchange.Redis
             ThrowIfNull(channel);
             if (handler == null && queue == null) { return CompletedTask<int>.Default(null); }
 
-            var sub = multiplexer.GetOrAddSubscription(channel, flags);
-            sub.Add(handler, queue);
+            var sub = multiplexer.AddToSubscription(channel, flags, handler, queue);
             return sub.EnsureSubscribedToServerAsync(this, channel, flags, false, server);
         }
 
@@ -304,11 +408,17 @@ namespace StackExchange.Redis
         public bool Unsubscribe(in RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags)
         {
             ThrowIfNull(channel);
-            // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server
-            // ReSharper disable once SimplifyConditionalTernaryExpression
-            return UnregisterSubscription(channel, handler, queue, out var sub)
-                ? sub.UnsubscribeFromServer(this, channel, flags, false)
-                : true;
+            if (!multiplexer.TryGetSubscription(channel, out var sub)) return true;
+
+            // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server;
+            // the latter while still holding the lock, see RetireIfEmpty
+            lock (sub.RegistrationLock)
+            {
+                // ReSharper disable once SimplifyConditionalTernaryExpression
+                return RetireIfEmpty(sub, handler, queue)
+                    ? UnsubscribeFromServerThenRemove(channel, sub, flags)
+                    : true;
+            }
         }
 
         Task ISubscriber.UnsubscribeAsync(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, CommandFlags flags)
@@ -317,36 +427,76 @@ namespace StackExchange.Redis
         public Task<bool> UnsubscribeAsync(in RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags)
         {
             ThrowIfNull(channel);
-            // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server
-            return UnregisterSubscription(channel, handler, queue, out var sub)
-                ? sub.UnsubscribeFromServerAsync(this, channel, flags, asyncState, false)
-                : CompletedTask<bool>.Default(asyncState);
+            if (!multiplexer.TryGetSubscription(channel, out var sub)) return CompletedTask<bool>.Default(asyncState);
+
+            // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server;
+            // the latter is issued (though not awaited) while still holding the lock, see RetireIfEmpty
+            lock (sub.RegistrationLock)
+            {
+                return RetireIfEmpty(sub, handler, queue)
+                    ? UnsubscribeFromServerThenRemoveAsync(channel, sub, flags)
+                    : CompletedTask<bool>.Default(asyncState);
+            }
         }
 
         /// <summary>
-        /// Unregisters a handler or queue and returns if we should remove it from the server.
+        /// Unregisters a handler or queue, and retires the subscription if that was its last one; must be called while
+        /// holding the subscription's <see cref="Subscription.RegistrationLock"/>. If it returns <see langword="true"/>, the
+        /// caller must then - still holding the lock - issue the unsubscribe command to the server, and only *then* remove
+        /// the subscription from the multiplexer (see <see cref="UnsubscribeFromServerThenRemove"/>). That way, a concurrent
+        /// subscribe to the same channel still finds this subscription until the unsubscribe command has been issued, and
+        /// so has to wait for the lock (only to find it retired, and to look up a fresh one); so its subscribe command is
+        /// issued after the unsubscribe command, rather than being able to overtake it and leave the server unsubscribed.
         /// </summary>
         /// <returns><see langword="true"/> if we should remove the subscription from the server, <see langword="false"/> otherwise.</returns>
-        private bool UnregisterSubscription(in RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, [NotNullWhen(true)] out Subscription? sub)
+        private static bool RetireIfEmpty(Subscription sub, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
         {
-            ThrowIfNull(channel);
-            if (multiplexer.TryGetSubscription(channel, out sub))
+            if (sub.IsRetired) return false; // already retired (and removed) concurrently
+
+            if ((handler == null) & (queue == null))
             {
-                if ((handler == null) & (queue == null))
-                {
-                    // This was a blanket wipe, so clear it completely
-                    sub.MarkCompleted();
-                    multiplexer.TryRemoveSubscription(channel, out _);
-                    return true;
-                }
-                else if (sub.Remove(handler, queue))
-                {
-                    // Or this was the last handler and/or queue, which also means unsubscribe
-                    multiplexer.TryRemoveSubscription(channel, out _);
-                    return true;
-                }
+                // This was a blanket wipe, so clear it completely
+                sub.MarkCompleted();
             }
-            return false;
+            else if (!sub.Remove(handler, queue))
+            {
+                // Not the last handler and/or queue, so the subscription stays
+                return false;
+            }
+
+            sub.MarkRetired();
+            return true;
+        }
+
+        private bool UnsubscribeFromServerThenRemove(in RedisChannel channel, Subscription sub, CommandFlags flags)
+        {
+            try
+            {
+                return sub.UnsubscribeFromServer(this, channel, flags, false);
+            }
+            catch (Exception ex)
+            {
+                multiplexer.OnUnsubscribeFailed(ex, channel, sub, flags);
+                throw;
+            }
+            finally
+            {
+                multiplexer.TryRemoveSubscription(channel, out _);
+            }
+        }
+
+        private Task<bool> UnsubscribeFromServerThenRemoveAsync(in RedisChannel channel, Subscription sub, CommandFlags flags)
+        {
+            try
+            {
+                var unsubscribe = sub.UnsubscribeFromServerAsync(this, channel, flags, asyncState, false);
+                multiplexer.ObserveUnsubscribe(unsubscribe, channel, sub, flags);
+                return unsubscribe;
+            }
+            finally
+            {
+                multiplexer.TryRemoveSubscription(channel, out _);
+            }
         }
 
         // TODO: We need a new api to support SUNSUBSCRIBE all. Calling this now would unsubscribe both sharded and unsharded channels.
@@ -356,10 +506,13 @@ namespace StackExchange.Redis
             var subs = multiplexer.GetSubscriptions();
             foreach (var pair in subs)
             {
-                if (subs.TryRemove(pair.Key, out var sub))
+                var sub = pair.Value;
+                lock (sub.RegistrationLock)
                 {
-                    sub.MarkCompleted();
-                    sub.UnsubscribeFromServer(this, pair.Key, flags, false);
+                    if (RetireIfEmpty(sub, null, null))
+                    {
+                        UnsubscribeFromServerThenRemove(pair.Key, sub, flags);
+                    }
                 }
             }
         }
@@ -371,10 +524,13 @@ namespace StackExchange.Redis
             var subs = multiplexer.GetSubscriptions();
             foreach (var pair in subs)
             {
-                if (subs.TryRemove(pair.Key, out var sub))
+                var sub = pair.Value;
+                lock (sub.RegistrationLock)
                 {
-                    sub.MarkCompleted();
-                    last = sub.UnsubscribeFromServerAsync(this, pair.Key, flags, asyncState, false);
+                    if (RetireIfEmpty(sub, null, null))
+                    {
+                        last = UnsubscribeFromServerThenRemoveAsync(pair.Key, sub, flags);
+                    }
                 }
             }
             return last ?? CompletedTask<bool>.Default(asyncState);

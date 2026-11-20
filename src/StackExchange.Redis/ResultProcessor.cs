@@ -539,6 +539,26 @@ namespace StackExchange.Redis
             private ConnectionMultiplexer.Subscription? Subscription { get; }
             public TrackSubscriptionsProcessor(ConnectionMultiplexer.Subscription? sub) => Subscription = sub;
 
+            public override bool SetResult(PhysicalConnection connection, Message message, ref RespReader reader)
+            {
+                // The server declining to run an unsubscribe of a retired subscription (e.g. BUSY) leaves it subscribed, with
+                // nothing left on the client to unsubscribe; this sees every reply (unlike the caller, who sees none of a
+                // fire-and-forget command's), so it's what notices, see ConnectionMultiplexer.OnUnsubscribeNotApplied. (The
+                // subscription was retired before the command was issued, and so before its reply is read.)
+                if (Subscription is { IsRetired: true } retired
+                    && message is Message.CommandChannelBase { Channel: var channel }
+                    && message.Command is RedisCommand.UNSUBSCRIBE or RedisCommand.SUNSUBSCRIBE or RedisCommand.PUNSUBSCRIBE)
+                {
+                    var copy = reader;
+                    copy.MovePastBof();
+                    if (copy.IsError && Availability.FaultContext.IsKnownNotApplied(RedisErrorKindMetadata.Classify(copy), CommandStatus.Sent))
+                    {
+                        connection.BridgeCouldBeNull?.Multiplexer.OnUnsubscribeNotApplied(channel, retired, message.Flags);
+                    }
+                }
+                return base.SetResult(connection, message, ref reader);
+            }
+
             protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
                 if (reader.IsAggregate)

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,6 +20,47 @@ public partial class ConnectionMultiplexer
         private Action<RedisChannel, RedisValue>? _handlers;
         private readonly object _handlersLock = new();
         private ChannelMessageQueue? _queues;
+
+        // Guards this subscription's registration: handlers/queues being added to it, versus it being retired once its
+        // last one is removed (at which point it is also removed from the multiplexer, and unsubscribed from the server).
+        // Without it, a handler could be added to a subscription that is concurrently being retired; that handler would
+        // then never be invoked, since nothing routes messages to a retired subscription (and the server has been told
+        // to stop sending them).
+        private readonly object _registrationLock = new();
+        private bool _isRetired;
+
+        /// <summary>
+        /// Held while retiring this subscription, see <see cref="TryAdd"/>.
+        /// </summary>
+        internal object RegistrationLock => _registrationLock;
+
+        internal bool IsRetired => _isRetired; // only meaningful while holding RegistrationLock
+
+        internal void MarkRetired() => _isRetired = true; // only to be called while holding RegistrationLock
+
+        private int _declinedUnsubscribes;
+
+        /// <summary>
+        /// Records that the server declined to run an unsubscribe of this (retired) subscription, see
+        /// <see cref="ConnectionMultiplexer.OnUnsubscribeNotApplied"/>.
+        /// </summary>
+        /// <returns>How many times that has happened so far.</returns>
+        internal int RecordDeclinedUnsubscribe() => Interlocked.Increment(ref _declinedUnsubscribes);
+
+        /// <summary>
+        /// Adds a handler and/or queue, unless this subscription has been retired (in which case the caller should
+        /// look it up again, which yields a fresh one).
+        /// </summary>
+        internal bool TryAdd(Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
+        {
+            lock (_registrationLock)
+            {
+                if (_isRetired) return false;
+                Add(handler, queue);
+                return true;
+            }
+        }
+
         public CommandFlags Flags { get; }
         public ResultProcessor.TrackSubscriptionsProcessor Processor { get; }
 
@@ -506,11 +548,18 @@ public partial class ConnectionMultiplexer
             object? asyncState,
             bool internalCall)
         {
-            bool any = false;
+            // issue all of them before awaiting any, so that they are all issued synchronously (see RegistrationLock)
+            var pending = new List<Task<bool>>();
             foreach (var server in _servers)
             {
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                any |= await subscriber.ExecuteAsync(message, Processor, server.Value).ForAwait();
+                pending.Add(subscriber.ExecuteAsync(message, Processor, server.Value));
+            }
+
+            bool any = false;
+            foreach (var task in pending)
+            {
+                any |= await task.ForAwait();
             }
 
             return any;

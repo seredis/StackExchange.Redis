@@ -130,7 +130,7 @@ public readonly struct FaultContext
     /// </remarks>
     public Maintenance.MaintenanceNotificationType MaintenanceType { get; }
 
-    private static bool IsKnownNotApplied(RedisErrorKind kind, CommandStatus status)
+    internal static bool IsKnownNotApplied(RedisErrorKind kind, CommandStatus status)
     {
         // the client never handed it to the socket, so the server cannot have seen it
         if (status is CommandStatus.WaitingToBeSent or CommandStatus.WaitingInBacklog) return true;
