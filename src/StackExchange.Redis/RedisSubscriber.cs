@@ -57,6 +57,96 @@ namespace StackExchange.Redis
             }
         }
 
+        private static readonly TimeSpan UnsubscribeRetryInitialDelay = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan UnsubscribeRetryMaxDelay = TimeSpan.FromSeconds(5);
+        private const int UnsubscribeRetryMaxAttempts = 30;
+
+        /// <summary>
+        /// Retiring a subscription removes it from the multiplexer whether or not the server-side unsubscribe succeeds. When
+        /// the server never ran that unsubscribe (e.g. it replied <c>BUSY</c>), it is still subscribed, and would keep pushing
+        /// messages that nothing receives, with nothing left on the client to unsubscribe; so this re-issues the unsubscribe,
+        /// after a backoff, unless the channel has been subscribed to again by then (at which point client and server agree
+        /// once more). It is called for each such failure - including those of the re-issued unsubscribes - from wherever the
+        /// failure is observed: <see cref="ResultProcessor.TrackSubscriptionsProcessor"/> for error replies (whether or not
+        /// anyone awaits the command, e.g. <see cref="CommandFlags.FireAndForget"/>), and <see cref="ObserveUnsubscribe"/>
+        /// for failures with no reply at all (the command never having been written).
+        /// </summary>
+        internal void OnUnsubscribeNotApplied(in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            var attempt = retired.RecordDeclinedUnsubscribe();
+            if (attempt > UnsubscribeRetryMaxAttempts) return;
+
+            var delay = TimeSpan.FromTicks(Math.Min(
+                UnsubscribeRetryInitialDelay.Ticks << Math.Min(attempt - 1, 16),
+                UnsubscribeRetryMaxDelay.Ticks));
+            _ = RetryUnsubscribeAsync(channel, retired, flags & Message.UserSelectableFlags, delay);
+        }
+
+        private async Task RetryUnsubscribeAsync(RedisChannel channel, Subscription retired, CommandFlags flags, TimeSpan delay)
+        {
+            try
+            {
+                await Task.Delay(delay).ForAwait();
+                if (_isDisposed) return;
+
+                var subscriber = (RedisSubscriber)GetSubscriber();
+                // only while the channel has no subscription again, and in order with any that's added afterwards; see
+                // TryIssueWhileUnsubscribed (otherwise, this could undo a subscription newer than the retired one)
+                if (TryIssueWhileUnsubscribed(channel, () => retired.UnsubscribeFromServerAsync(subscriber, channel, flags, null, true), out var unsubscribe))
+                {
+                    ObserveUnsubscribe(unsubscribe, channel, retired, flags);
+                }
+            }
+            catch
+            {
+                // e.g. the multiplexer was disposed meanwhile; nothing more to do
+            }
+        }
+
+        /// <summary>
+        /// Observes the outcome of a retired subscription's unsubscribe, to retry it if it was never written (so the server
+        /// never saw it); a failure the server replied with is left to <see cref="ResultProcessor.TrackSubscriptionsProcessor"/>,
+        /// which sees every reply, rather than only those of awaited commands.
+        /// </summary>
+        internal void ObserveUnsubscribe(Task unsubscribe, in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            if (unsubscribe.Status is TaskStatus.RanToCompletion) return;
+
+            var observedChannel = channel;
+            _ = unsubscribe.ContinueWith(
+                t =>
+                {
+                    if (t.Exception?.InnerException is { } fault) OnUnsubscribeFailed(fault, observedChannel, retired, flags);
+                },
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        }
+
+        internal void OnUnsubscribeFailed(Exception fault, in RedisChannel channel, Subscription retired, CommandFlags flags)
+        {
+            if (fault is RedisServerException) return; // a reply; see TrackSubscriptionsProcessor
+            if (new Availability.FaultContext(fault).NotApplied) OnUnsubscribeNotApplied(channel, retired, flags);
+        }
+
+        /// <summary>
+        /// Issues a command via <paramref name="issue"/>, unless <paramref name="channel"/> has a subscription; holding the
+        /// same lock as <see cref="GetOrAddSubscription"/>, so that a subscription added afterwards has its subscribe command
+        /// issued after this one.
+        /// </summary>
+        /// <returns><see langword="true"/> if the command was issued, <see langword="false"/> if the channel has a subscription.</returns>
+        internal bool TryIssueWhileUnsubscribed(in RedisChannel channel, Func<Task<bool>> issue, [NotNullWhen(true)] out Task<bool>? issued)
+        {
+            lock (subscriptions)
+            {
+                if (subscriptions.ContainsKey(channel))
+                {
+                    issued = null;
+                    return false;
+                }
+                issued = issue();
+                return true;
+            }
+        }
+
         /// <summary>
         /// Gets the subscriber counts for a channel.
         /// </summary>
@@ -384,6 +474,11 @@ namespace StackExchange.Redis
             {
                 return sub.UnsubscribeFromServer(this, channel, flags, false);
             }
+            catch (Exception ex)
+            {
+                multiplexer.OnUnsubscribeFailed(ex, channel, sub, flags);
+                throw;
+            }
             finally
             {
                 multiplexer.TryRemoveSubscription(channel, out _);
@@ -394,7 +489,9 @@ namespace StackExchange.Redis
         {
             try
             {
-                return sub.UnsubscribeFromServerAsync(this, channel, flags, asyncState, false);
+                var unsubscribe = sub.UnsubscribeFromServerAsync(this, channel, flags, asyncState, false);
+                multiplexer.ObserveUnsubscribe(unsubscribe, channel, sub, flags);
+                return unsubscribe;
             }
             finally
             {

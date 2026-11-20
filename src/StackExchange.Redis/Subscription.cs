@@ -38,6 +38,15 @@ public partial class ConnectionMultiplexer
 
         internal void MarkRetired() => _isRetired = true; // only to be called while holding RegistrationLock
 
+        private int _declinedUnsubscribes;
+
+        /// <summary>
+        /// Records that the server declined to run an unsubscribe of this (retired) subscription, see
+        /// <see cref="ConnectionMultiplexer.OnUnsubscribeNotApplied"/>.
+        /// </summary>
+        /// <returns>How many times that has happened so far.</returns>
+        internal int RecordDeclinedUnsubscribe() => Interlocked.Increment(ref _declinedUnsubscribes);
+
         /// <summary>
         /// Adds a handler and/or queue, unless this subscription has been retired (in which case the caller should
         /// look it up again, which yields a fresh one).
