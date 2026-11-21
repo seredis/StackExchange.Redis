@@ -81,10 +81,20 @@ options.Password = await GetFreshTokenAsync();
 await muxer.ReauthenticateAsync();
 ```
 
-One caveat: a RESP2 connection with active subscriptions is in subscriber mode, which rejects `AUTH`; such
-connections are skipped, and instead rely on the server disconnecting them when their authentication lapses
-(the automatic reconnect then picks up the updated credentials). Under RESP3 - the default where supported -
-subscription connections are re-authenticated in place, avoiding that gap.
+One caveat: a RESP2 connection with active subscriptions is in subscriber mode, which rejects `AUTH`; by
+default such connections are skipped, and instead rely on the server disconnecting them when their
+authentication lapses (the automatic reconnect then picks up the updated credentials). Under RESP3 - the
+default where supported - subscription connections are re-authenticated in place, avoiding that gap.
+
+If the server *enforces* credential expiry on established connections (vanilla Redis password rotation does
+not; token-enforcing services do), waiting for that disconnect means losing publications at a moment of the
+server's choosing. `ReauthenticateOptions.AllowReconnect` opts into recycling such connections proactively
+instead - an immediate reconnect that authenticates with the fresh credentials and restores the subscriptions,
+trading a brief, *controlled* interruption for the uncontrolled one:
+
+``` csharp
+await muxer.ReauthenticateAsync(ReauthenticateOptions.AllowReconnect);
+```
 
 ## Client certificates
 

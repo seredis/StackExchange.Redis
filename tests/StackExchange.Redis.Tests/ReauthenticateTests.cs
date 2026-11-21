@@ -145,6 +145,30 @@ public class ReauthenticateTests(ITestOutputHelper log)
     }
 
     [Fact]
+    public async Task Resp2SubscribedWithAllowReconnectRecyclesTheSubscriptionConnection()
+    {
+        // on a server that *enforces* credential expiry, waiting for the lapse loses publications at a
+        // moment of the server's choosing; AllowReconnect trades that for a controlled recycle now
+        var (server, conn) = await ConnectAsync(RedisProtocol.Resp2);
+        using (server)
+        await using (conn)
+        {
+            var (channel, received) = await SubscribeAndVerifyAsync(conn);
+
+            var before = server.AuthCommands;
+            var count = await conn.ReauthenticateAsync(ReauthenticateOptions.AllowReconnect);
+
+            Assert.Equal(2, count); // interactive AUTH + subscription recycle
+            // the recycle completes asynchronously: the replacement connection's handshake carries its own
+            // AUTH, so the server eventually sees two - one in-place, one from the fresh handshake
+            Assert.True(
+                await Poll.UntilAsync(() => server.AuthCommands - before >= 2),
+                "the recycled subscription connection should re-authenticate via its handshake");
+            await AssertDeliversAsync(conn, channel, received); // and the subscription was restored
+        }
+    }
+
+    [Fact]
     public async Task NoCredentialsThrows()
     {
         var (server, conn) = await ConnectAsync(RedisProtocol.Resp3, withPassword: false);

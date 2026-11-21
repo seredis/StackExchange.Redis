@@ -21,16 +21,22 @@ public partial class ConnectionMultiplexer
     /// reconnects - then call this method to refresh the connections that are already established.
     /// </para>
     /// <para>
-    /// A RESP2 connection that has active subscriptions is in subscriber mode, which rejects <c>AUTH</c>; such
-    /// connections are skipped, and rely on the server disconnecting them when their authentication lapses (the
-    /// automatic reconnect then authenticates with the current credentials). RESP3 subscription connections, and
-    /// RESP2 subscription connections with no active subscriptions, are re-authenticated in place.
+    /// A RESP2 connection that has active subscriptions is in subscriber mode, which rejects <c>AUTH</c>; by
+    /// default such connections are skipped, and rely on the server disconnecting them when their authentication
+    /// lapses (the automatic reconnect then authenticates with the current credentials) - or they can be
+    /// proactively recycled via <see cref="ReauthenticateOptions.AllowReconnect"/>. RESP3 subscription
+    /// connections, and RESP2 subscription connections with no active subscriptions, are re-authenticated in
+    /// place.
     /// </para>
     /// </remarks>
+    /// <param name="options">Controls how connections that cannot be re-authenticated in place are treated;
+    /// see <see cref="ReauthenticateOptions.AllowReconnect"/>.</param>
     /// <param name="flags">The command flags to use; with <see cref="CommandFlags.FireAndForget"/> the
     /// acknowledgements are not awaited, so authentication failures are not reported.</param>
-    /// <returns>The number of connections the <c>AUTH</c> was issued to.</returns>
-    public async Task<int> ReauthenticateAsync(CommandFlags flags = CommandFlags.None)
+    /// <returns>The number of connections covered: an <c>AUTH</c> issued, or (with
+    /// <see cref="ReauthenticateOptions.AllowReconnect"/>) a recycle initiated - the recycle completes
+    /// asynchronously, after this method returns.</returns>
+    public async Task<int> ReauthenticateAsync(ReauthenticateOptions options = ReauthenticateOptions.None, CommandFlags flags = CommandFlags.None)
     {
         var config = RawConfig;
         var user = config.User;
@@ -42,6 +48,7 @@ public partial class ConnectionMultiplexer
         }
         CommandMap.AssertAvailable(RedisCommand.AUTH);
 
+        int recycled = 0;
         List<Task<bool>>? pending = null;
         foreach (var server in _serverSnapshot)
         {
@@ -54,19 +61,30 @@ public partial class ConnectionMultiplexer
             }
 
             if (!server.SharesSubscriptionConnection()
-                && server.GetBridge(ConnectionType.Subscription, create: false) is { IsConnected: true } subscription
+                && server.GetBridge(ConnectionType.Subscription, create: false) is { IsConnected: true } subscription)
+            {
                 // in-place AUTH on an actively-subscribed connection is only legal from RESP3; a RESP2
                 // connection that has no subscriptions is not yet in subscriber mode, so it still works there
-                && (subscription.Physical?.Protocol is >= RedisProtocol.Resp3 || subscription.SubscriptionCount == 0))
-            {
-                var subscriptionAuth = CreateAuthMessage(user, password, flags, forSubscriptionBridge: true);
-                (pending ??= new()).Add(ExecuteAsyncImpl(subscriptionAuth, ResultProcessor.DemandOK, state: null, server, defaultValue: false));
+                if (subscription.Physical?.Protocol is >= RedisProtocol.Resp3 || subscription.SubscriptionCount == 0)
+                {
+                    var subscriptionAuth = CreateAuthMessage(user, password, flags, forSubscriptionBridge: true);
+                    (pending ??= new()).Add(ExecuteAsyncImpl(subscriptionAuth, ResultProcessor.DemandOK, state: null, server, defaultValue: false));
+                }
+                else if ((options & ReauthenticateOptions.AllowReconnect) != 0)
+                {
+                    // subscriber mode rejects AUTH: recycle instead - the reconnect handshake authenticates
+                    // with the current credentials and restores the subscriptions, with new work held in the
+                    // backlog meanwhile; this is the same deliberate-drop the MOVING handoff uses
+                    if (subscription.RecycleConnection("reauthenticate")) recycled++;
+                }
             }
         }
 
-        if (pending is null) return 0;
-        await Task.WhenAll(pending).ForAwait();
-        return pending.Count;
+        if (pending is not null)
+        {
+            await Task.WhenAll(pending).ForAwait();
+        }
+        return (pending?.Count ?? 0) + recycled;
     }
 
     private static Message CreateAuthMessage(string? user, string password, CommandFlags flags, bool forSubscriptionBridge)

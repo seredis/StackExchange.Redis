@@ -21,5 +21,8 @@
 [SER012]StackExchange.Redis.IServer.ClusterSlotStatsOrderBy(StackExchange.Redis.ClusterSlotStatsMetric metric, long limit = 0, StackExchange.Redis.Order order = StackExchange.Redis.Order.Descending, StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> StackExchange.Redis.ClusterSlotStatsResult?
 [SER012]StackExchange.Redis.IServer.ClusterSlotStatsOrderByAsync(StackExchange.Redis.ClusterSlotStatsMetric metric, long limit = 0, StackExchange.Redis.Order order = StackExchange.Redis.Order.Descending, StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> System.Threading.Tasks.Task<StackExchange.Redis.ClusterSlotStatsResult?>!
 StackExchange.Redis.RedisFeatures.ClusterSlotStats.get -> bool
-StackExchange.Redis.ConnectionMultiplexer.ReauthenticateAsync(StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> System.Threading.Tasks.Task<int>!
-StackExchange.Redis.IConnectionMultiplexer.ReauthenticateAsync(StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> System.Threading.Tasks.Task<int>!
+StackExchange.Redis.ConnectionMultiplexer.ReauthenticateAsync(StackExchange.Redis.ReauthenticateOptions options = StackExchange.Redis.ReauthenticateOptions.None, StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> System.Threading.Tasks.Task<int>!
+StackExchange.Redis.IConnectionMultiplexer.ReauthenticateAsync(StackExchange.Redis.ReauthenticateOptions options = StackExchange.Redis.ReauthenticateOptions.None, StackExchange.Redis.CommandFlags flags = StackExchange.Redis.CommandFlags.None) -> System.Threading.Tasks.Task<int>!
+StackExchange.Redis.ReauthenticateOptions
+StackExchange.Redis.ReauthenticateOptions.None = 0 -> StackExchange.Redis.ReauthenticateOptions
+StackExchange.Redis.ReauthenticateOptions.AllowReconnect = 1 -> StackExchange.Redis.ReauthenticateOptions
