@@ -64,6 +64,28 @@ await options.ConfigureForAzureWithUserAssignedManagedIdentityAsync(managedIdent
 
 For details and samples see [https://github.com/Azure/Microsoft.Azure.StackExchangeRedis](https://github.com/Azure/Microsoft.Azure.StackExchangeRedis)
 
+## Rotating credentials on a live connection
+
+Token-based authentication (such as Entra ID) means credentials that *expire*; some servers (Azure Managed Redis,
+for example) retire the authentication of long-lived connections unless they re-authenticate in time. Two things
+are needed to keep a multiplexer healthy across rotation:
+
+1. Update `User` / `Password` on the same `ConfigurationOptions` instance that was used to connect; the multiplexer
+   reads it live, so any later *reconnect* automatically authenticates with the current values.
+2. Call `ReauthenticateAsync()` on the multiplexer, which re-issues `AUTH` with those credentials on every
+   *established* connection - including dedicated subscription connections, which cannot be reached via
+   `IServer` commands (an `Execute("AUTH", ...)` loop only covers the interactive connections):
+
+``` csharp
+options.Password = await GetFreshTokenAsync();
+await muxer.ReauthenticateAsync();
+```
+
+One caveat: a RESP2 connection with active subscriptions is in subscriber mode, which rejects `AUTH`; such
+connections are skipped, and instead rely on the server disconnecting them when their authentication lapses
+(the automatic reconnect then picks up the updated credentials). Under RESP3 - the default where supported -
+subscription connections are re-authenticated in place, avoiding that gap.
+
 ## Client certificates
 
 If the server is configured to require a client certificate, this can be supplied in multiple ways.

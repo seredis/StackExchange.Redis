@@ -248,6 +248,20 @@ public interface IConnectionMultiplexer : IDisposable, IAsyncDisposable
     Task<bool> ConfigureAsync(TextWriter? log = null);
 
     /// <summary>
+    /// Re-issues <c>AUTH</c> with the currently configured credentials (<see cref="ConfigurationOptions.User"/> and
+    /// <see cref="ConfigurationOptions.Password"/>) on every connected server, including dedicated subscription
+    /// connections - which are not reachable via <see cref="IServer"/> commands. Intended for token-based credential
+    /// rotation: update the credentials on the <see cref="ConfigurationOptions"/> used to create this multiplexer
+    /// (which also covers any later reconnects), then call this method to refresh the connections that are already
+    /// established. A RESP2 connection with active subscriptions is in subscriber mode, which rejects <c>AUTH</c>;
+    /// such connections are skipped, and rely on the automatic reconnect when their authentication lapses.
+    /// </summary>
+    /// <param name="flags">The command flags to use; with <see cref="CommandFlags.FireAndForget"/> the
+    /// acknowledgements are not awaited, so authentication failures are not reported.</param>
+    /// <returns>The number of connections the <c>AUTH</c> was issued to.</returns>
+    Task<int> ReauthenticateAsync(CommandFlags flags = CommandFlags.None);
+
+    /// <summary>
     /// Reconfigure the current connections based on the existing configuration.
     /// </summary>
     /// <param name="log">The log to write output to.</param>
