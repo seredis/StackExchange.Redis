@@ -168,6 +168,81 @@ public class ReauthenticateTests(ITestOutputHelper log)
         }
     }
 
+    // The ad-hoc mirror: existing rotation callers (the Microsoft.Azure.StackExchangeRedis extension does
+    // `server.ExecuteAsync("AUTH", user, password)` per server on token refresh) predate ReauthenticateAsync,
+    // so an ad-hoc AUTH against an IServer is shadowed onto that server's dedicated subscription connection
+    // wherever ReauthenticateAsync itself would AUTH it in place - giving those callers the fix for free.
+
+    [Fact]
+    public async Task Resp3AdHocServerAuthMirrorsToSubscriptionConnection()
+    {
+        var (server, conn) = await ConnectAsync(RedisProtocol.Resp3);
+        using (server)
+        await using (conn)
+        {
+            var (channel, received) = await SubscribeAndVerifyAsync(conn);
+
+            var before = server.AuthCommands;
+            var result = await conn.GetServer(conn.GetEndPoints()[0]).ExecuteAsync("AUTH", Password);
+            Assert.Equal("OK", result.ToString());
+
+            // the shadow is fire-and-forget relative to the caller's command, so poll for it
+            Assert.True(
+                await Poll.UntilAsync(() => server.AuthCommands - before >= 2),
+                "the ad-hoc AUTH should be mirrored to the subscription connection");
+            Assert.Equal(2, server.AuthCommands - before);
+            Assert.Equal(1, server.SubscriberAuthCommands);
+            await AssertDeliversAsync(conn, channel, received); // the subscription survived
+        }
+    }
+
+    [Fact]
+    public async Task Resp2UnsubscribedAdHocServerAuthMirrorsToSubscriptionConnection()
+    {
+        // a RESP2 subscription connection with no live subscriptions is not in subscriber mode, so it
+        // can (and should) be refreshed in place, exactly as ReauthenticateAsync does; established by
+        // subscribing then unsubscribing, because the connection only exists once something subscribes
+        var (server, conn) = await ConnectAsync(RedisProtocol.Resp2);
+        using (server)
+        await using (conn)
+        {
+            var (channel, _) = await SubscribeAndVerifyAsync(conn);
+            await conn.GetSubscriber().UnsubscribeAsync(channel);
+
+            var before = server.AuthCommands;
+            var result = await conn.GetServer(conn.GetEndPoints()[0]).ExecuteAsync("AUTH", Password);
+            Assert.Equal("OK", result.ToString());
+
+            Assert.True(
+                await Poll.UntilAsync(() => server.AuthCommands - before >= 2),
+                "the ad-hoc AUTH should be mirrored to the idle subscription connection");
+            Assert.Equal(2, server.AuthCommands - before);
+        }
+    }
+
+    [Fact]
+    public async Task Resp2SubscribedAdHocServerAuthLeavesTheSubscriberConnectionAlone()
+    {
+        // subscriber mode rejects AUTH under RESP2: mirroring there would only generate a protocol
+        // error on the connection, so the shadow is suppressed - the lapse/reconnect cycle (or an
+        // explicit ReauthenticateAsync with AllowReconnect) remains the route for this case
+        var (server, conn) = await ConnectAsync(RedisProtocol.Resp2);
+        using (server)
+        await using (conn)
+        {
+            var (channel, received) = await SubscribeAndVerifyAsync(conn);
+
+            var before = server.AuthCommands;
+            var result = await conn.GetServer(conn.GetEndPoints()[0]).ExecuteAsync("AUTH", Password);
+            Assert.Equal("OK", result.ToString());
+
+            // a full pub/sub round-trip gives any (wrongly) issued shadow time to arrive
+            await AssertDeliversAsync(conn, channel, received);
+            Assert.Equal(1, server.AuthCommands - before);
+            Assert.Equal(0, server.SubscriberAuthCommands);
+        }
+    }
+
     [Fact]
     public async Task NoCredentialsThrows()
     {

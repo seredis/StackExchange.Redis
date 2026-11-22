@@ -74,7 +74,7 @@ are needed to keep a multiplexer healthy across rotation:
    reads it live, so any later *reconnect* automatically authenticates with the current values.
 2. Call `ReauthenticateAsync()` on the multiplexer, which re-issues `AUTH` with those credentials on every
    *established* connection - including dedicated subscription connections, which cannot be reached via
-   `IServer` commands (an `Execute("AUTH", ...)` loop only covers the interactive connections):
+   `IServer` commands (those always target the interactive connection):
 
 ``` csharp
 options.Password = await GetFreshTokenAsync();
@@ -95,6 +95,17 @@ trading a brief, *controlled* interruption for the uncontrolled one:
 ``` csharp
 await muxer.ReauthenticateAsync(ReauthenticateOptions.AllowReconnect);
 ```
+
+### Existing ad-hoc `AUTH` callers
+
+Code written before this API typically rotates credentials with an ad-hoc command per server -
+`server.Execute("AUTH", user, password)` - which only ever reaches the interactive connection. The library now
+recognises an ad-hoc `AUTH` issued against an `IServer` and automatically shadows it onto that server's
+dedicated subscription connection wherever `ReauthenticateAsync` would have re-authenticated it in place
+(RESP3, or RESP2 without active subscriptions), so such callers get the subscription-connection refresh without
+code changes. The shadow is best-effort: the caller's result reflects only their own command, and the RESP2
+subscriber-mode gap above still applies - `ReauthenticateAsync` with `AllowReconnect` remains the complete
+answer.
 
 ## Client certificates
 

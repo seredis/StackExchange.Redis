@@ -1089,6 +1089,7 @@ namespace StackExchange.Redis
         public RedisResult Execute(string command, ICollection<object> args, CommandFlags flags = CommandFlags.None)
         {
             var msg = new RedisDatabase.ExecuteMessage(multiplexer?.CommandMap, DatabaseForAdHoc(command), flags, command, args);
+            MirrorAuthToSubscriptionConnection(msg, command, args, flags);
             return ExecuteSync(msg, ResultProcessor.ScriptResult, defaultValue: RedisResult.NullSingle);
         }
 
@@ -1097,7 +1098,32 @@ namespace StackExchange.Redis
         public Task<RedisResult> ExecuteAsync(string command, ICollection<object> args, CommandFlags flags = CommandFlags.None)
         {
             var msg = new RedisDatabase.ExecuteMessage(multiplexer?.CommandMap, DatabaseForAdHoc(command), flags, command, args);
+            MirrorAuthToSubscriptionConnection(msg, command, args, flags);
             return ExecuteAsync(msg, ResultProcessor.ScriptResult, defaultValue: RedisResult.NullSingle);
+        }
+
+        /// <summary>
+        /// An ad-hoc <c>AUTH</c> against this server (how existing credential-rotation callers such as the
+        /// Microsoft.Azure.StackExchangeRedis extension refresh an Entra ID token) only reaches the interactive
+        /// connection, silently leaving a dedicated subscription connection on the old credentials. Shadow the
+        /// same command onto that connection where one exists and can accept it - RESP3, or RESP2 not yet in
+        /// subscriber mode - so rotation isn't limited to callers that know about
+        /// <see cref="ConnectionMultiplexer.ReauthenticateAsync"/>. Best-effort by design: the caller's result
+        /// reflects only their own command, and a RESP2 connection with active subscriptions is left for the
+        /// server to retire, exactly as <see cref="ConnectionMultiplexer.ReauthenticateAsync"/> defaults to.
+        /// </summary>
+        private void MirrorAuthToSubscriptionConnection(Message msg, string command, ICollection<object>? args, CommandFlags flags)
+        {
+            if (msg.Command == RedisCommand.AUTH
+                && !server.SharesSubscriptionConnection()
+                && server.GetBridge(ConnectionType.Subscription, create: false) is { IsConnected: true } subscription
+                && (subscription.Physical?.Protocol is >= RedisProtocol.Resp3 || subscription.SubscriptionCount == 0))
+            {
+                var shadow = new RedisDatabase.ExecuteMessage(multiplexer.CommandMap, -1, flags, command, args);
+                shadow.SetInternalCall();
+                shadow.SetForSubscriptionBridge();
+                multiplexer.ExecuteAsyncImpl(shadow, ResultProcessor.DemandOK, state: null, server, defaultValue: false).ObserveErrors();
+            }
         }
 
         /// <summary>
@@ -1129,6 +1155,7 @@ namespace StackExchange.Redis
         {
             var db = multiplexer.ApplyDefaultDatabase(database ?? -1);
             var msg = new RedisDatabase.ExecuteMessage(multiplexer?.CommandMap, db, flags, command, args);
+            MirrorAuthToSubscriptionConnection(msg, command, args, flags);
             return ExecuteSync(msg, ResultProcessor.ScriptResult, defaultValue: RedisResult.NullSingle);
         }
 
@@ -1136,6 +1163,7 @@ namespace StackExchange.Redis
         {
             var db = multiplexer.ApplyDefaultDatabase(database ?? -1);
             var msg = new RedisDatabase.ExecuteMessage(multiplexer?.CommandMap, db, flags, command, args);
+            MirrorAuthToSubscriptionConnection(msg, command, args, flags);
             return ExecuteAsync(msg, ResultProcessor.ScriptResult, defaultValue: RedisResult.NullSingle);
         }
 
