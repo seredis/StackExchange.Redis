@@ -77,6 +77,42 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         finally { server.Release.Set(); }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeferredRestoreIsRedrivenWhenTheInFlightAttemptFails(bool pattern)
+    {
+        // an internal restore that backs off in favour of an in-flight attempt is owed a retry if that
+        // attempt fails: the restore paths are event-driven, so nothing else would bring the subscription back
+        using var server = new PausedSubscribeServer(output) { FailFirstSubscribe = true };
+        await using var connection = await server.ConnectAsync();
+        var subscriber = connection.DefaultSubscriber;
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.channel");
+        var subscription = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        var firstServer = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var first = subscription.EnsureSubscribedToServerAsync(subscriber, channel, CommandFlags.None, true, firstServer);
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+
+            // the server can see the subscribe before the client has finished marking that connection as
+            // established; an attempt on a connection that is not (yet) established is fair game for takeover,
+            // which is not what this test is about
+            Assert.True(await Poll.UntilAsync(() => firstServer.IsSubscriberConnected, timeoutMilliseconds: 5000));
+            Assert.Equal(1, await subscription.EnsureSubscribedToServerAsync(subscriber, channel, CommandFlags.None, true).WithTimeout(5000));
+            Assert.False(subscription.IsConnectedAny());
+            Assert.Equal(0, Volatile.Read(ref server.SecondSubscribeCount));
+            server.Release.Set();
+            await Assert.ThrowsAsync<RedisServerException>(() => first.WithTimeout(5000));
+            Assert.True(await Poll.UntilAsync(() => subscription.IsConnectedAny(), timeoutMilliseconds: 5000), "the deferred restore was never re-driven");
+            Assert.Equal(1, subscription.GetConnectionCount());
+        }
+        finally
+        {
+            server.Release.Set();
+        }
+    }
+
     [Fact]
     public async Task ReconnectedSubscriptionUsesTheNewPhysicalConnection()
     {
@@ -154,6 +190,7 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         public readonly ManualResetEventSlim Release = new();
         public readonly TaskCompletionSource<bool> FirstSubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int FirstSubscribeCount, SecondSubscribeCount;
+        public bool FailFirstSubscribe;
         public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public PausedSubscribeServer(ITestOutputHelper output) : base(output) => SecondEndPoint = AddEmptyNode();
@@ -166,9 +203,10 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
                 TryGetNode(DefaultEndPoint, out var firstNode);
                 if (ReferenceEquals(client.Node, firstNode))
                 {
-                    Interlocked.Increment(ref FirstSubscribeCount);
+                    int attempt = Interlocked.Increment(ref FirstSubscribeCount);
                     FirstSubscribe.TrySetResult(true);
                     if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test subscription barrier timed out.");
+                    if (FailFirstSubscribe && attempt == 1) return TypedRedisValue.Error("ERR test: subscribe declined");
                 }
                 else
                 {

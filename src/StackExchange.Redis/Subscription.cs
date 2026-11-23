@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -341,7 +342,7 @@ public partial class ConnectionMultiplexer
 
             var message = GetSubscriptionMessage(channel, SubscriptionAction.Subscribe, flags, internalCall, stripFireAndForget: true);
             var selected = subscriber.multiplexer.SelectServer(message);
-            switch (BeginSubscribeAttempt(selected, internalCall, out var claim))
+            switch (BeginSubscribeAttempt(subscriber, channel, selected, internalCall, out var claim))
             {
                 case SubscribeAttempt.AlreadyConnected: return 0;
                 case SubscribeAttempt.Deferred: return 1;
@@ -374,21 +375,28 @@ public partial class ConnectionMultiplexer
             Begun, // proceed to subscribe (holding the claim, when one was available)
         }
 
-        private SubscribeAttempt BeginSubscribeAttempt(ServerEndPoint? selected, bool internalCall, out PendingClaim? claim)
+        private SubscribeAttempt BeginSubscribeAttempt(RedisSubscriber subscriber, in RedisChannel channel, ServerEndPoint? selected, bool internalCall, out PendingClaim? claim)
         {
-            if (!TryClaim(selected, out claim))
+            while (!TryClaim(selected, out claim, out var inFlight))
             {
                 if (internalCall)
                 {
-                    // another subscribe attempt is already in flight; back off - its completion
-                    // (ack or failure) resolves the state, retried via the usual restore paths
-                    return SubscribeAttempt.Deferred;
+                    // another subscribe attempt is already in flight; back off - if it is acknowledged,
+                    // there is nothing left to do; if it fails, releasing its claim re-drives the restore
+                    // on our behalf (the restore paths are event-driven: nothing else would retry it)
+                    inFlight.DeferTo(subscriber, channel);
+                    if (ReferenceEquals(Volatile.Read(ref _pending), inFlight)) return SubscribeAttempt.Deferred;
+
+                    // it completed while we were registering our interest, so it may not have seen
+                    // it; go around again and compete for the claim ourselves
+                    continue;
                 }
 
                 // a user-initiated subscribe must preserve "acknowledged or thrown" semantics, so it
                 // cannot silently defer to the in-flight attempt (which may yet fail, unobserved by
                 // this caller); proceed unclaimed - ack-time reconciliation mops up any duplicate
                 claim = null;
+                break;
             }
 
             // we're not appropriately connected, so blank the server out for eligible reconnection -
@@ -425,27 +433,64 @@ public partial class ConnectionMultiplexer
             }
         }
 
-        private bool TryClaim(ServerEndPoint? selected, out PendingClaim? claim)
+        private bool TryClaim(ServerEndPoint? selected, out PendingClaim? claim, [NotNullWhen(false)] out PendingClaim? inFlight)
         {
+            inFlight = null;
             if (selected is null)
             {
-                // nothing selectable right now; attempt unclaimed (ack-time reconciliation
-                // still protects against duplicates)
+                // nothing selectable right now, so there is no server to claim against; the attempt
+                // goes unclaimed (ack-time reconciliation still protects against duplicates) - but
+                // not while a claimed attempt is in flight on a live connection, which this one
+                // would otherwise race onto whichever server the message is eventually routed to
                 claim = null;
-                return true;
+                var live = Volatile.Read(ref _pending);
+                if (live is null || !live.Server.IsSubscriberConnected) return true;
+
+                inFlight = live;
+                return false;
             }
 
             claim = new PendingClaim(this, selected);
-            // if another subscribe attempt is already in flight, back off; its completion
-            // (ack or failure) will resolve the state, retried via the usual restore paths
-            return Interlocked.CompareExchange(ref _pending, claim, null) is null;
+            var existing = Volatile.Read(ref _pending);
+            while (true)
+            {
+                // if another subscribe attempt is already in flight, back off; its completion
+                // (ack or failure) will resolve the state, retried via the usual restore paths -
+                // unless it is aimed at a server we are no longer connected to: that attempt is
+                // parked in a backlog that may never drain (or only when a long timeout expires),
+                // and nothing re-drives the restores that deferred to it, so the subscription
+                // would sit on no server at all; take the claim over instead. If the parked
+                // attempt is ever written and acknowledged, ack-time reconciliation mops it up.
+                if (existing is not null && existing.Server.IsSubscriberConnected)
+                {
+                    inFlight = existing;
+                    return false;
+                }
+
+                var seen = Interlocked.CompareExchange(ref _pending, claim, existing);
+                if (ReferenceEquals(seen, existing)) return true;
+                existing = seen;
+            }
         }
 
         private void Release(PendingClaim? claim)
         {
-            if (claim is not null)
+            if (claim is not null
+                && ReferenceEquals(Interlocked.CompareExchange(ref _pending, null, claim), claim)
+                && claim.TryTakeDeferred(out var subscriber, out var channel)
+                && !IsConnectedAny())
             {
-                Interlocked.CompareExchange(ref _pending, null, claim);
+                // this attempt ended without a confirmed server (an ack clears the claim directly, in
+                // TryAdoptEndpoint, and never comes through here), and a restore backed off in its
+                // favour; that restore is owed, so run it now
+                try
+                {
+                    ObserveClaim(EnsureSubscribedToServerAsync(subscriber, channel, CommandFlags.FireAndForget, internalCall: true), null);
+                }
+                catch (Exception ex)
+                {
+                    subscriber.multiplexer.OnInternalError(ex);
+                }
             }
         }
 
@@ -490,7 +535,7 @@ public partial class ConnectionMultiplexer
 
             var message = GetSubscriptionMessage(channel, SubscriptionAction.Subscribe, flags, internalCall, stripFireAndForget: true);
             server ??= subscriber.multiplexer.SelectServer(message);
-            switch (BeginSubscribeAttempt(server, internalCall, out var claim))
+            switch (BeginSubscribeAttempt(subscriber, channel, server, internalCall, out var claim))
             {
                 case SubscribeAttempt.AlreadyConnected: return 0;
                 case SubscribeAttempt.Deferred: return 1;
@@ -518,7 +563,32 @@ public partial class ConnectionMultiplexer
 
         private sealed class PendingClaim(SingleNodeSubscription owner, ServerEndPoint server)
         {
+            private RedisSubscriber? _deferredSubscriber;
+            private RedisChannel _deferredChannel;
+
             public ServerEndPoint Server { get; } = server;
+
+            // records that a restore backed off in favour of this attempt; see Release
+            public void DeferTo(RedisSubscriber subscriber, in RedisChannel channel)
+            {
+                lock (this)
+                {
+                    _deferredChannel = channel;
+                    _deferredSubscriber = subscriber;
+                }
+            }
+
+            public bool TryTakeDeferred([NotNullWhen(true)] out RedisSubscriber? subscriber, out RedisChannel channel)
+            {
+                lock (this)
+                {
+                    subscriber = _deferredSubscriber;
+                    channel = _deferredChannel;
+                    _deferredSubscriber = null;
+                }
+
+                return subscriber is not null;
+            }
 
             public void Release() => owner.Release(this);
         }
