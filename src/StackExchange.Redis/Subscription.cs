@@ -324,11 +324,10 @@ public partial class ConnectionMultiplexer
                 _currentServer = null;
             }
 
-            var pending = Volatile.Read(ref _pending);
-            if (pending is not null && !pending.Server.IsSubscriberConnected)
-            {
-                Interlocked.CompareExchange(ref _pending, null, pending);
-            }
+            // note: a pending claim aimed at a server we are no longer connected to is deliberately
+            // left in place; it does not obstruct anything (TryClaim takes such a claim over), and
+            // clearing it here would discard any restore that deferred to it: its owner's Release
+            // would no longer match, so nothing would re-drive that restore
         }
 
         internal override int EnsureSubscribedToServer(
@@ -468,7 +467,19 @@ public partial class ConnectionMultiplexer
                 }
 
                 var seen = Interlocked.CompareExchange(ref _pending, claim, existing);
-                if (ReferenceEquals(seen, existing)) return true;
+                if (ReferenceEquals(seen, existing))
+                {
+                    // a taken-over claim can no longer release itself (it is not the pending one), so
+                    // a restore that deferred to it would be forgotten; we are an attempt for the same
+                    // subscription, so that restore is now owed by us instead
+                    if (existing is not null && existing.TryTakeDeferred(out var subscriber, out var channel))
+                    {
+                        claim.DeferTo(subscriber, channel);
+                    }
+
+                    return true;
+                }
+
                 existing = seen;
             }
         }
