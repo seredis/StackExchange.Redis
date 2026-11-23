@@ -390,7 +390,7 @@ public partial class ConnectionMultiplexer
             int count = 0;
             foreach (var server in _servers)
             {
-                if (server.Value.IsSubscriberConnected)
+                if (!server.Value.IsSubscriberConnected)
                 {
                     // flag for removal
                     if (scratch.Length == count) // need to resize the scratch buffer, using the pool
