@@ -370,6 +370,27 @@ public sealed class KeyPrefixedDatabaseTests
     }
 
     [Fact]
+    public void KeyBless()
+    {
+        prefixed.KeyBless("key", BlessFlags.NoEvict, CommandFlags.None);
+        mock.Received().KeyBless("prefix:key", BlessFlags.NoEvict, CommandFlags.None);
+    }
+
+    [Fact]
+    public void KeyUnbless()
+    {
+        prefixed.KeyUnbless("key", BlessFlags.NoEvict, CommandFlags.None);
+        mock.Received().KeyUnbless("prefix:key", BlessFlags.NoEvict, CommandFlags.None);
+    }
+
+    [Fact]
+    public void KeyBlessFlags()
+    {
+        prefixed.KeyBlessFlags("key", CommandFlags.None);
+        mock.Received().KeyBlessFlags("prefix:key", CommandFlags.None);
+    }
+
+    [Fact]
     public void KeyRandom()
     {
         Assert.Throws<NotSupportedException>(() => prefixed.KeyRandom());
@@ -482,6 +503,28 @@ public sealed class KeyPrefixedDatabaseTests
     {
         prefixed.ListMove("key", "destination", ListSide.Left, ListSide.Right, CommandFlags.None);
         mock.Received().ListMove("prefix:key", "prefix:destination", ListSide.Left, ListSide.Right, CommandFlags.None);
+    }
+
+    [Fact]
+    public void SortedSetMove()
+    {
+        prefixed.SortedSetMove("key", "destination", Order.Descending, 3, CommandFlags.None);
+        mock.Received().SortedSetMove("prefix:key", "prefix:destination", Order.Descending, 3, CommandFlags.None);
+    }
+
+    [Fact]
+    public void SortedSetMoveByScore()
+    {
+        prefixed.SortedSetMoveByScore("key", "destination", 1, 2, Exclude.Start, 3, CommandFlags.None);
+        mock.Received().SortedSetMoveByScore("prefix:key", "prefix:destination", 1, 2, Exclude.Start, 3, CommandFlags.None);
+    }
+
+    [Fact]
+    public void SortedSetMoveMembers()
+    {
+        RedisValue[] members = ["a", "b"];
+        prefixed.SortedSetMoveMembers("key", "destination", members, When.NotExists, CommandFlags.None);
+        mock.Received().SortedSetMoveMembers("prefix:key", "prefix:destination", members, When.NotExists, CommandFlags.None);
     }
 
     [Fact]

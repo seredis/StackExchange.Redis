@@ -195,6 +195,7 @@ internal static class CommandFlagsExtensions
                 case RedisCommand.DEL:
                 case RedisCommand.UNLINK:
                 case RedisCommand.PERSIST:
+                case RedisCommand.BLESS: // SET/CLEAR converge on a flag state; GET/SCAN are lowered to reads where we can see the subcommand
                 case RedisCommand.RENAMENX:
                 case RedisCommand.COPY: // default behavior fails if dest exists; REPLACE is raised where we can see the args
                 case RedisCommand.MOVE:
@@ -286,6 +287,8 @@ internal static class CommandFlagsExtensions
                 case RedisCommand.ZPOPMIN:
                 case RedisCommand.ZPOPMAX:
                 case RedisCommand.ZMPOP:
+                case RedisCommand.ZMOVE: // a replay moves further members (MIN/MAX), or finds the first batch already gone
+                case RedisCommand.ZMOVEMEMBER:
                 case RedisCommand.XADD: // explicit ids and IDMP/IDMPAUTO are demoted where we can see the args
                 case RedisCommand.PFMERGE: // destination accumulates union each call
                 case RedisCommand.BITFIELD: // INCRBY sub-ops compound; demoted to last-wins when the payload has none

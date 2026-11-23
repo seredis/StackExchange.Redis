@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Diagnostics.CodeAnalysis;
+using RESPite;
 using RESPite.Messages;
 
 namespace StackExchange.Redis
@@ -10,7 +12,7 @@ namespace StackExchange.Redis
     {
         internal static readonly ResultProcessor<CommandTrace[]> Processor = new CommandTraceProcessor();
 
-        internal CommandTrace(long uniqueId, long time, long duration, RedisValue[] arguments)
+        internal CommandTrace(long uniqueId, long time, long duration, RedisValue[] arguments, long cpuTimeMicroseconds = -1)
         {
             UniqueId = uniqueId;
             Time = RedisBase.UnixEpoch.AddSeconds(time);
@@ -19,6 +21,9 @@ namespace StackExchange.Redis
             // So 1 microsecond = 10 ticks
             Duration = TimeSpan.FromTicks(duration * 10);
             Arguments = arguments;
+#pragma warning disable SER011 // assigning the experimental property
+            CpuTime = cpuTimeMicroseconds < 0 ? null : TimeSpan.FromTicks(cpuTimeMicroseconds * 10);
+#pragma warning restore SER011
         }
 
         /// <summary>
@@ -35,6 +40,17 @@ namespace StackExchange.Redis
         /// The time at which the logged command was processed.
         /// </summary>
         public DateTime Time { get; }
+
+        /// <summary>
+        /// An upper-bound estimate of the executing thread's CPU time (user and system) for the command:
+        /// the duration minus the off-CPU time that provably happened during it. This distinguishes a command
+        /// that ran slowly from one that was starved of CPU. Reported by Redis 8.12 and later;
+        /// <see langword="null"/> when the server did not report it. The server reports
+        /// <see cref="TimeSpan.Zero"/> when the time was not measured: a command that was blocked, one
+        /// shorter than 10 milliseconds, or <c>off-cpu-tracking</c> disabled.
+        /// </summary>
+        [Experimental(Experiments.Server_8_12, UrlFormat = Experiments.UrlFormat)]
+        public TimeSpan? CpuTime { get; }
 
         /// <summary>
         /// A unique progressive identifier for every slow log entry.
@@ -98,7 +114,16 @@ namespace StackExchange.Redis
                             && reader.TryMoveNext() && reader.IsAggregate)
                         {
                             var values = reader.ReadPastRedisValues() ?? [];
-                            result = new CommandTrace(uniqueId, time, duration, values);
+                            // positional trailing fields: 5 client address (4.0+), 6 client name (4.0+),
+                            // 7 argument count (8.10+), 8 estimated CPU time in microseconds (8.12+);
+                            // negative means "not reported", so an older server's shorter entry maps to null
+                            long cpuTime = -1;
+                            if (reader.TryMoveNext() && reader.TryMoveNext() && reader.TryMoveNext()
+                                && reader.TryMoveNext() && reader.IsScalar && reader.TryReadInt64(out var micros))
+                            {
+                                cpuTime = micros;
+                            }
+                            result = new CommandTrace(uniqueId, time, duration, values, cpuTime);
                         }
                     }
                     return result;

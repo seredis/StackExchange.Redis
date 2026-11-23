@@ -323,6 +323,27 @@ namespace StackExchange.Redis.Tests
         }
 
         [Fact]
+        public async Task KeyBlessAsync()
+        {
+            await prefixed.KeyBlessAsync("key", BlessFlags.NoEvict, CommandFlags.None);
+            await mock.Received().KeyBlessAsync("prefix:key", BlessFlags.NoEvict, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task KeyUnblessAsync()
+        {
+            await prefixed.KeyUnblessAsync("key", BlessFlags.NoEvict, CommandFlags.None);
+            await mock.Received().KeyUnblessAsync("prefix:key", BlessFlags.NoEvict, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task KeyBlessFlagsAsync()
+        {
+            await prefixed.KeyBlessFlagsAsync("key", CommandFlags.None);
+            await mock.Received().KeyBlessFlagsAsync("prefix:key", CommandFlags.None);
+        }
+
+        [Fact]
         public Task KeyRandomAsync()
         {
             return Assert.ThrowsAsync<NotSupportedException>(() => prefixed.KeyRandomAsync());
@@ -435,6 +456,28 @@ namespace StackExchange.Redis.Tests
         {
             await prefixed.ListMoveAsync("key", "destination", ListSide.Left, ListSide.Right, CommandFlags.None);
             await mock.Received().ListMoveAsync("prefix:key", "prefix:destination", ListSide.Left, ListSide.Right, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task SortedSetMoveAsync()
+        {
+            await prefixed.SortedSetMoveAsync("key", "destination", Order.Descending, 3, CommandFlags.None);
+            await mock.Received().SortedSetMoveAsync("prefix:key", "prefix:destination", Order.Descending, 3, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task SortedSetMoveByScoreAsync()
+        {
+            await prefixed.SortedSetMoveByScoreAsync("key", "destination", 1, 2, Exclude.Start, 3, CommandFlags.None);
+            await mock.Received().SortedSetMoveByScoreAsync("prefix:key", "prefix:destination", 1, 2, Exclude.Start, 3, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task SortedSetMoveMembersAsync()
+        {
+            RedisValue[] members = ["a", "b"];
+            await prefixed.SortedSetMoveMembersAsync("key", "destination", members, When.NotExists, CommandFlags.None);
+            await mock.Received().SortedSetMoveMembersAsync("prefix:key", "prefix:destination", members, When.NotExists, CommandFlags.None);
         }
 
         [Fact]

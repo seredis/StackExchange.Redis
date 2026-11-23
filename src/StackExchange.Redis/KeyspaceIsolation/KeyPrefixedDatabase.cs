@@ -265,6 +265,15 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public bool KeyPersist(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.KeyPersist(ToInner(key), flags);
 
+        public bool KeyBless(RedisKey key, BlessFlags bless, CommandFlags flags = CommandFlags.None) =>
+            Inner.KeyBless(ToInner(key), bless, flags);
+
+        public bool KeyUnbless(RedisKey key, BlessFlags bless, CommandFlags flags = CommandFlags.None) =>
+            Inner.KeyUnbless(ToInner(key), bless, flags);
+
+        public BlessFlags KeyBlessFlags(RedisKey key, CommandFlags flags = CommandFlags.None) =>
+            Inner.KeyBlessFlags(ToInner(key), flags);
+
         public RedisKey KeyRandom(CommandFlags flags = CommandFlags.None) =>
             throw new NotSupportedException("RANDOMKEY is not supported when a key-prefix is specified");
 
@@ -465,6 +474,12 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public bool SetAdd(RedisKey key, RedisValue value, CommandFlags flags = CommandFlags.None) =>
             Inner.SetAdd(ToInner(key), value, flags);
 
+        public bool SetAdd(RedisKey key, RedisValue value, Expiration expiry, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetAdd(ToInner(key), value, expiry, when, flags);
+
+        public bool SetAdd(RedisKey key, RedisValue[] values, Expiration expiry, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetAdd(ToInner(key), values, expiry, when, flags);
+
         public long SetCombineAndStore(SetOperation operation, RedisKey destination, RedisKey[] keys, CommandFlags flags = CommandFlags.None) =>
             Inner.SetCombineAndStore(operation, ToInner(destination), ToInner(keys), flags);
 
@@ -491,6 +506,21 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public long SetLength(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.SetLength(ToInner(key), flags);
+
+        public ExpireResult[] SetMemberExpire(RedisKey key, RedisValue[] members, TimeSpan expiry, ExpireWhen when = ExpireWhen.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetMemberExpire(ToInner(key), members, expiry, when, flags);
+
+        public ExpireResult[] SetMemberExpire(RedisKey key, RedisValue[] members, DateTime expiry, ExpireWhen when = ExpireWhen.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetMemberExpire(ToInner(key), members, expiry, when, flags);
+
+        public long[] SetMemberGetExpireDateTime(RedisKey key, RedisValue[] members, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetMemberGetExpireDateTime(ToInner(key), members, flags);
+
+        public long[] SetMemberGetTimeToLive(RedisKey key, RedisValue[] members, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetMemberGetTimeToLive(ToInner(key), members, flags);
+
+        public PersistResult[] SetMemberPersist(RedisKey key, RedisValue[] members, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetMemberPersist(ToInner(key), members, flags);
 
         public RedisValue[] SetMembers(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.SetMembers(ToInner(key), flags);
@@ -648,6 +678,15 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public SortedSetPopResult SortedSetPop(RedisKey[] keys, long count, Order order = Order.Ascending, CommandFlags flags = CommandFlags.None) =>
             Inner.SortedSetPop(ToInner(keys), count, order, flags);
+
+        public SortedSetEntry[]? SortedSetMove(RedisKey sourceKey, RedisKey destinationKey, Order order = Order.Ascending, long? count = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.SortedSetMove(ToInner(sourceKey), ToInner(destinationKey), order, count, flags);
+
+        public SortedSetEntry[]? SortedSetMoveByScore(RedisKey sourceKey, RedisKey destinationKey, double start, double stop, Exclude exclude = Exclude.None, long? count = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.SortedSetMoveByScore(ToInner(sourceKey), ToInner(destinationKey), start, stop, exclude, count, flags);
+
+        public SortedSetEntry[]? SortedSetMoveMembers(RedisKey sourceKey, RedisKey destinationKey, RedisValue[] members, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.SortedSetMoveMembers(ToInner(sourceKey), ToInner(destinationKey), members, when, flags);
 
         public long StreamAcknowledge(RedisKey key, RedisValue groupName, RedisValue messageId, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAcknowledge(ToInner(key), groupName, messageId, flags);
@@ -816,6 +855,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public long StringBitPosition(RedisKey key, bool bit, long start = 0, long end = -1, StringIndexType indexType = StringIndexType.Byte, CommandFlags flags = CommandFlags.None) =>
             Inner.StringBitPosition(ToInner(key), bit, start, end, indexType, flags);
+
+        public long[] StringBitPositions(RedisKey key, bool bit, long start = 0, long end = -1, StringIndexType indexType = StringIndexType.Byte, long? limit = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.StringBitPositions(ToInner(key), bit, start, end, indexType, limit, flags);
 
         public bool StringDelete(RedisKey key, ValueCondition when, CommandFlags flags = CommandFlags.None) =>
             Inner.StringDelete(ToInner(key), when, flags);
