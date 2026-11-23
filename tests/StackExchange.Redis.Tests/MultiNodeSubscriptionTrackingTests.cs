@@ -37,7 +37,7 @@ public class MultiNodeSubscriptionTrackingTests(ITestOutputHelper output)
         // a node that is tracked but not connected, as one is after its subscription connection drops
         using var dead = new ServerEndPoint(connection, new IPEndPoint(IPAddress.Loopback, 1), ServerProvenance.Configured);
         Assert.False(dead.IsSubscriberConnected);
-        subscription.AddEndpoint(dead);
+        Assert.True(subscription.TryAdoptEndpoint(dead));
 
         // what ServerEndPoint.OnDisconnected runs when any subscription connection drops
         connection.UpdateSubscriptions();
