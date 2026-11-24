@@ -28,14 +28,15 @@ public partial class ConnectionMultiplexer
         // then never be invoked, since nothing routes messages to a retired subscription (and the server has been told
         // to stop sending them).
         private readonly object _registrationLock = new();
-        private bool _isRetired;
+        private volatile bool _isRetired; // one-way: never cleared once set
 
         /// <summary>
         /// Held while retiring this subscription, see <see cref="TryAdd"/>.
         /// </summary>
         internal object RegistrationLock => _registrationLock;
 
-        internal bool IsRetired => _isRetired; // only meaningful while holding RegistrationLock
+        // a "false" is only dependable while holding RegistrationLock; a "true" is final, with or without it
+        internal bool IsRetired => _isRetired;
 
         internal void MarkRetired() => _isRetired = true; // only to be called while holding RegistrationLock
 
@@ -369,6 +370,10 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
+            // a retired subscription is still visible to the restore paths until its unsubscribe has been issued;
+            // subscribing it again would leave the server sending messages for a channel the client has forgotten
+            if (IsRetired) return 0;
+
             RemoveIncorrectRouting(subscriber, in channel, flags, internalCall);
             if (IsConnectedAny()) return 0;
 
@@ -574,6 +579,10 @@ public partial class ConnectionMultiplexer
             bool internalCall,
             ServerEndPoint? server = null)
         {
+            // a retired subscription is still visible to the restore paths until its unsubscribe has been issued;
+            // subscribing it again would leave the server sending messages for a channel the client has forgotten
+            if (IsRetired) return 0;
+
             RemoveIncorrectRouting(subscriber, in channel, flags, internalCall);
             if (IsConnectedAny()) return 0;
 
@@ -743,6 +752,10 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
+            // a retired subscription is still visible to the restore paths until its unsubscribe has been issued;
+            // subscribing it again would leave the server sending messages for a channel the client has forgotten
+            if (IsRetired) return 0;
+
             int delta = 0;
             var muxer = subscriber.multiplexer;
             foreach (var server in muxer.GetServerSnapshot())
@@ -779,6 +792,10 @@ public partial class ConnectionMultiplexer
             bool internalCall,
             ServerEndPoint? server = null)
         {
+            // a retired subscription is still visible to the restore paths until its unsubscribe has been issued;
+            // subscribing it again would leave the server sending messages for a channel the client has forgotten
+            if (IsRetired) return 0;
+
             int delta = 0;
             var muxer = subscriber.multiplexer;
             var snapshot = muxer.GetServerSnaphotMemory();
