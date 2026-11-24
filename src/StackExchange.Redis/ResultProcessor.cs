@@ -538,8 +538,48 @@ namespace StackExchange.Redis
 
         public sealed class TrackSubscriptionsProcessor : ResultProcessor<bool>
         {
+            private readonly bool _cleanup;
             private ConnectionMultiplexer.Subscription? Subscription { get; }
-            public TrackSubscriptionsProcessor(ConnectionMultiplexer.Subscription? sub) => Subscription = sub;
+
+            // cleanup: used for the unsubscribe that removes a stray server-side registration, see UnsubscribeStray
+            public TrackSubscriptionsProcessor(ConnectionMultiplexer.Subscription? sub, bool cleanup = false)
+            {
+                Subscription = sub;
+                _cleanup = cleanup;
+            }
+
+            public override bool SetResult(PhysicalConnection connection, Message message, ref RespReader reader)
+            {
+                // An unsubscribe that the server declined to run (BUSY, LOADING, ...) leaves it subscribed. When
+                // the client has nothing left that would unsubscribe it - the subscription is retired, or this
+                // was the removal of a stray - it has to be issued again, or the server keeps sending messages
+                // that nothing wants until the connection is replaced. This sees every reply, including that of
+                // a fire-and-forget command, which no caller does.
+                bool declined = false;
+                if (Subscription is { } sub && (_cleanup || sub.IsRetired)
+                    && message.Command is RedisCommand.UNSUBSCRIBE or RedisCommand.PUNSUBSCRIBE or RedisCommand.SUNSUBSCRIBE)
+                {
+                    var copy = reader;
+                    copy.MovePastBof();
+                    declined = copy.IsError && IsTransientRefusal(RedisErrorKindMetadata.Classify(copy));
+                }
+
+                var result = base.SetResult(connection, message, ref reader);
+                if (declined && result
+                    && message is Message.CommandChannelBase channelMessage
+                    && connection.BridgeCouldBeNull is { } bridge)
+                {
+                    bridge.Multiplexer.OnUnsubscribeDeclined(Subscription!, channelMessage.Channel, bridge.ServerEndPoint, connection);
+                }
+
+                return result;
+            }
+
+            // the server's own state, reported before running anything, and expected to pass; not redirects
+            // (the node is telling us the subscription is not its to hold) or permission errors (which a
+            // retry would only repeat)
+            private static bool IsTransientRefusal(RedisErrorKind kind) => kind
+                is RedisErrorKind.Busy or RedisErrorKind.Loading or RedisErrorKind.TryAgain or RedisErrorKind.ClusterDown;
 
             protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {

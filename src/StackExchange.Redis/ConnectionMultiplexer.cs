@@ -1429,6 +1429,7 @@ namespace StackExchange.Redis
 
                 CheckTopologyRefreshDue(now);
                 if (_isSentinel) CheckManagedPrimariesDemoted();
+                RetryDeclinedUnsubscribes();
 
                 var tmp = GetServerSnapshot();
                 int token = 0;

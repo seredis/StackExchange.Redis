@@ -57,6 +57,12 @@ public partial class ConnectionMultiplexer
         public CommandFlags Flags { get; }
         public ResultProcessor.TrackSubscriptionsProcessor Processor { get; }
 
+        // for the unsubscribe that removes a stray server-side registration; rarely needed
+        internal ResultProcessor.TrackSubscriptionsProcessor CleanupProcessor
+            => _cleanupProcessor ?? Interlocked.CompareExchange(ref _cleanupProcessor, new(this, cleanup: true), null) ?? _cleanupProcessor!;
+
+        private ResultProcessor.TrackSubscriptionsProcessor? _cleanupProcessor;
+
         internal abstract bool IsConnectedAny();
         internal abstract bool IsConnectedTo(EndPoint endpoint);
 

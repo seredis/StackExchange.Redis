@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Threading.Tasks;
@@ -150,29 +151,89 @@ namespace StackExchange.Redis
         /// </summary>
         internal void UnsubscribeStray(Subscription sub, in RedisChannel channel, ServerEndPoint server)
         {
-            // If the channel has since been subscribed afresh, that newer subscription may be using this very server,
-            // or be about to; an unsubscribe from us that reached the server after its subscribe would leave it
-            // believing it is subscribed when it is not, which is the worst outcome available: messages silently
-            // stop. So the stray is only removed when the newer subscription is known to be elsewhere; otherwise
-            // it is left alone, and at worst lingers as a duplicate if the newer subscription settles on another
-            // server. The lock is the one subscriptions are created under, so one created after we look sends
-            // its subscribe after our unsubscribe.
+            // The channel's current owner - this subscription if it is still live, or one created since it was
+            // retired - may be using this very server, or be about to; an unsubscribe from us that reached the
+            // server after its subscribe would leave it believing it is subscribed when it is not, which is the
+            // worst outcome available: messages silently stop. So the stray is only removed when the owner is
+            // known to be elsewhere; otherwise it is left alone, and at worst lingers as a duplicate if the owner
+            // settles on another server. The lock is the one subscriptions are created under, so one created after
+            // we look sends its subscribe after our unsubscribe.
             lock (subscriptions)
             {
-                if (subscriptions.TryGetValue(channel, out var current) && !ReferenceEquals(current, sub))
+                if (subscriptions.TryGetValue(channel, out var owner) && !(ReferenceEquals(owner, sub) && sub.IsRetired))
                 {
                     // a multi-node subscription wants every eligible node, so "elsewhere" does not apply to it
-                    if (current is not SingleNodeSubscription
-                        || !current.IsConnectedAny()
-                        || current.IsConnectedTo(server.EndPoint))
+                    if (owner is not SingleNodeSubscription
+                        || !owner.IsConnectedAny()
+                        || owner.IsConnectedTo(server.EndPoint))
                     {
                         return;
                     }
                 }
 
-                // fire-and-forget: we are on the read loop, so we must not block
+                // fire-and-forget: this runs on the read loop and the heartbeat, neither of which may block
                 var unsubscribe = sub.GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, CommandFlags.FireAndForget, internalCall: true);
-                ExecuteSyncImpl(unsubscribe, sub.Processor, server);
+                ExecuteSyncImpl(unsubscribe, sub.CleanupProcessor, server);
+            }
+        }
+
+        // unsubscribes the server declined to run, to be issued again; see TrackSubscriptionsProcessor.SetResult
+        private readonly List<DeclinedUnsubscribe> _declinedUnsubscribes = new();
+
+        private sealed class DeclinedUnsubscribe(Subscription subscription, in RedisChannel channel, ServerEndPoint server, PhysicalConnection connection)
+        {
+            public Subscription Subscription { get; } = subscription;
+            public RedisChannel Channel { get; } = channel;
+            public ServerEndPoint Server { get; } = server;
+            public PhysicalConnection Connection { get; } = connection;
+        }
+
+        internal void OnUnsubscribeDeclined(Subscription sub, in RedisChannel channel, ServerEndPoint server, PhysicalConnection connection)
+        {
+            lock (_declinedUnsubscribes)
+            {
+                for (int i = _declinedUnsubscribes.Count - 1; i >= 0; i--)
+                {
+                    var existing = _declinedUnsubscribes[i];
+                    if (ReferenceEquals(existing.Server, server) && existing.Channel == channel)
+                    {
+                        _declinedUnsubscribes.RemoveAt(i);
+                    }
+                }
+
+                _declinedUnsubscribes.Add(new DeclinedUnsubscribe(sub, channel, server, connection));
+            }
+        }
+
+        /// <summary>
+        /// Issues again any unsubscribe that the server declined to run; driven by the heartbeat, so a server that
+        /// keeps declining is asked once per heartbeat for as long as the connection it is subscribed on lives.
+        /// </summary>
+        internal void RetryDeclinedUnsubscribes()
+        {
+            DeclinedUnsubscribe[] due;
+            lock (_declinedUnsubscribes)
+            {
+                if (_declinedUnsubscribes.Count == 0) return;
+                due = _declinedUnsubscribes.ToArray();
+                _declinedUnsubscribes.Clear();
+            }
+
+            foreach (var item in due)
+            {
+                try
+                {
+                    // server-side subscriptions die with their connection, so there is nothing to remove from a
+                    // replacement; and if the channel has been subscribed again, UnsubscribeStray leaves it be
+                    if (item.Connection.BridgeCouldBeNull is { } bridge && ReferenceEquals(bridge.Physical, item.Connection))
+                    {
+                        UnsubscribeStray(item.Subscription, item.Channel, item.Server);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    OnInternalError(ex);
+                }
             }
         }
 

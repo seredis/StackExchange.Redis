@@ -77,6 +77,38 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         finally { server.Release.Set(); }
     }
 
+    // The removal of a stray is the only thing that will ever unsubscribe it, so one the server declines to run
+    // (BUSY, LOADING, ...) has to be issued again; otherwise the stray delivers duplicates until reconnect (#3375).
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeclinedStrayCleanupIsRetried(bool pattern)
+    {
+        using var server = new PausedSubscribeServer(output) { UnsubscribeRefusals = 1 };
+        var config = server.GetClientConfig();
+        config.AsyncTimeout = 200;
+        config.HeartbeatInterval = TimeSpan.FromMilliseconds(20);
+        await using var connection = await ConnectionMultiplexer.ConnectAsync(config);
+        var channel = pattern ? RedisChannel.Pattern("restoration.*") : RedisChannel.Literal("restoration.channel");
+        var subscription = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+        var firstServer = connection.GetServerEndPoint(server.DefaultEndPoint, ServerProvenance.Configured);
+        var secondServer = connection.GetServerEndPoint(server.SecondEndPoint, ServerProvenance.Configured);
+        var first = subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true, firstServer);
+        try
+        {
+            await server.FirstSubscribe.Task.WithTimeout(5000);
+            await Assert.ThrowsAsync<RedisTimeoutException>(() => first.WithTimeout(5000));
+            await subscription.EnsureSubscribedToServerAsync(connection.DefaultSubscriber, channel, CommandFlags.None, true, secondServer).WithTimeout(5000);
+            server.Release.Set();
+
+            // only an unsubscribe that the server ran completes this
+            await server.FirstUnsubscribe.Task.WithTimeout(5000);
+            Assert.Equal(1, Volatile.Read(ref server.RefusedUnsubscribeCount));
+            Assert.Same(secondServer, subscription.GetAnyCurrentServer());
+        }
+        finally { server.Release.Set(); }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -360,8 +392,9 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
         public EndPoint SecondEndPoint { get; }
         public readonly ManualResetEventSlim Release = new();
         public readonly TaskCompletionSource<bool> FirstSubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public int FirstSubscribeCount, SecondSubscribeCount, UnsubscribeCount;
+        public int FirstSubscribeCount, SecondSubscribeCount, UnsubscribeCount, RefusedUnsubscribeCount;
         public bool FailFirstSubscribe;
+        public int UnsubscribeRefusals; // how many unsubscribes to decline before running them
         public readonly TaskCompletionSource<bool> FirstUnsubscribe = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public PausedSubscribeServer(ITestOutputHelper output) : base(output) => SecondEndPoint = AddEmptyNode();
@@ -383,6 +416,13 @@ public class SubscriptionRestorationTests(ITestOutputHelper output)
                 {
                     Interlocked.Increment(ref SecondSubscribeCount);
                 }
+            }
+            if ((request.IsString(0, "UNSUBSCRIBE"u8) || request.IsString(0, "PUNSUBSCRIBE"u8))
+                && request.GetString(1).Contains("restoration.")
+                && Interlocked.Decrement(ref UnsubscribeRefusals) >= 0)
+            {
+                Interlocked.Increment(ref RefusedUnsubscribeCount);
+                return TypedRedisValue.Error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.");
             }
             var result = base.Execute(client, in request);
             if ((request.IsString(0, "UNSUBSCRIBE"u8) || request.IsString(0, "PUNSUBSCRIBE"u8))
