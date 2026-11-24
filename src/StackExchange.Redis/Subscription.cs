@@ -61,8 +61,14 @@ public partial class ConnectionMultiplexer
         internal abstract bool IsConnectedTo(EndPoint endpoint);
 
         // Called when a (P|S)SUBSCRIBE acknowledgement arrives; returns false when the ack is a
-        // stray (we are already confirmed on a different, connected server) and the caller should
-        // remove the server-side registration it represents.
+        // stray and the caller should remove the server-side registration it represents: either we
+        // are already confirmed on a different, connected server, or this subscription was retired
+        // while the subscribe was in flight (so the unsubscribe had no server to send anything to).
+        //
+        // For a retired subscription, exactly one side owns that removal: retiring takes the recorded
+        // server(s) *after* marking the subscription retired, and an ack records its server *before*
+        // looking at whether the subscription is retired; whichever of the two then takes the server
+        // back out is the one that unsubscribes it.
         internal abstract bool TryAdoptEndpoint(ServerEndPoint server);
 
         // conditional clear
@@ -279,6 +285,13 @@ public partial class ConnectionMultiplexer
                 current = seen;
             }
 
+            if (adopted && IsRetired && Interlocked.CompareExchange(ref _currentServer, null, server) == server)
+            {
+                // retired while this subscribe was in flight, and the unsubscribe did not see this
+                // server (it would have taken it, see UnsubscribeFromServer): the removal is ours
+                adopted = false;
+            }
+
             // an ack from the pending claim's server resolves that claim whether or not we adopted
             // it - but it must be released only *after* the adoption is visible; released first, a
             // competing restore could claim and observe the pre-adoption state (no live server),
@@ -309,7 +322,8 @@ public partial class ConnectionMultiplexer
             CommandFlags flags,
             bool internalCall)
         {
-            var server = _currentServer;
+            // take the server, so that a late subscribe acknowledgement can tell whether we saw it; see TryAdoptEndpoint
+            var server = Interlocked.Exchange(ref _currentServer, null);
             if (server is not null)
             {
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
@@ -326,7 +340,8 @@ public partial class ConnectionMultiplexer
             object? asyncState,
             bool internalCall)
         {
-            var server = _currentServer;
+            // take the server, so that a late subscribe acknowledgement can tell whether we saw it; see TryAdoptEndpoint
+            var server = Interlocked.Exchange(ref _currentServer, null);
             if (server is not null)
             {
                 var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
@@ -679,14 +694,16 @@ public partial class ConnectionMultiplexer
 
         internal override bool TryAdoptEndpoint(ServerEndPoint server)
         {
-            // multi-node subscriptions want every eligible node, so an ack is never a stray
+            // multi-node subscriptions want every eligible node, so an ack is never a stray - unless
+            // the subscription was retired while the subscribe was in flight, and the unsubscribe did
+            // not see this server (it would have taken it, see UnsubscribeFromServer)
             var ep = server.EndPoint;
             if (!_servers.TryAdd(ep, server))
             {
                 _servers[ep] = server;
             }
 
-            return true;
+            return !(IsRetired && _servers.TryRemove(ep, out _));
         }
 
         internal override bool TryRemoveEndpoint(ServerEndPoint expected)
@@ -826,10 +843,14 @@ public partial class ConnectionMultiplexer
             bool internalCall)
         {
             bool any = false;
-            foreach (var server in _servers)
+            foreach (var pair in _servers)
             {
-                var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                any |= subscriber.ExecuteSync(message, Processor, server.Value);
+                // take each server, so that a late subscribe acknowledgement can tell whether we saw it; see TryAdoptEndpoint
+                if (_servers.TryRemove(pair.Key, out var server))
+                {
+                    var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
+                    any |= subscriber.ExecuteSync(message, Processor, server);
+                }
             }
 
             return any;
@@ -844,10 +865,14 @@ public partial class ConnectionMultiplexer
         {
             // issue all of them before awaiting any, so that they are all issued synchronously (see RegistrationLock)
             var pending = new List<Task<bool>>();
-            foreach (var server in _servers)
+            foreach (var pair in _servers)
             {
-                var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                pending.Add(subscriber.ExecuteAsync(message, Processor, server.Value));
+                // take each server, so that a late subscribe acknowledgement can tell whether we saw it; see TryAdoptEndpoint
+                if (_servers.TryRemove(pair.Key, out var server))
+                {
+                    var message = GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
+                    pending.Add(subscriber.ExecuteAsync(message, Processor, server));
+                }
             }
 
             bool any = false;

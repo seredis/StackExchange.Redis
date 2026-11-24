@@ -144,6 +144,38 @@ namespace StackExchange.Redis
             return count;
         }
 
+        /// <summary>
+        /// Removes the server-side registration left by a subscribe acknowledgement that the subscription did not
+        /// adopt, see <see cref="Subscription.TryAdoptEndpoint"/>.
+        /// </summary>
+        internal void UnsubscribeStray(Subscription sub, in RedisChannel channel, ServerEndPoint server)
+        {
+            // If the channel has since been subscribed afresh, that newer subscription may be using this very server,
+            // or be about to; an unsubscribe from us that reached the server after its subscribe would leave it
+            // believing it is subscribed when it is not, which is the worst outcome available: messages silently
+            // stop. So the stray is only removed when the newer subscription is known to be elsewhere; otherwise
+            // it is left alone, and at worst lingers as a duplicate if the newer subscription settles on another
+            // server. The lock is the one subscriptions are created under, so one created after we look sends
+            // its subscribe after our unsubscribe.
+            lock (subscriptions)
+            {
+                if (subscriptions.TryGetValue(channel, out var current) && !ReferenceEquals(current, sub))
+                {
+                    // a multi-node subscription wants every eligible node, so "elsewhere" does not apply to it
+                    if (current is not SingleNodeSubscription
+                        || !current.IsConnectedAny()
+                        || current.IsConnectedTo(server.EndPoint))
+                    {
+                        return;
+                    }
+                }
+
+                // fire-and-forget: we are on the read loop, so we must not block
+                var unsubscribe = sub.GetSubscriptionMessage(channel, SubscriptionAction.Unsubscribe, CommandFlags.FireAndForget, internalCall: true);
+                ExecuteSyncImpl(unsubscribe, sub.Processor, server);
+            }
+        }
+
         internal enum SubscriptionAction
         {
             Subscribe,

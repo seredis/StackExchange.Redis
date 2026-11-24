@@ -569,19 +569,14 @@ namespace StackExchange.Redis
                                     case RedisCommand.PSUBSCRIBE:
                                         if (Subscription is { } sub && !sub.TryAdoptEndpoint(ep))
                                         {
-                                            // the subscription is already confirmed on a different live server:
-                                            // this ack is a stray from an overlapping restore (#3336); remove
-                                            // the server-side registration it created, or it would deliver
-                                            // duplicate messages indefinitely (fire-and-forget: we are on the
-                                            // read loop, so we must not block)
+                                            // this ack is a stray: the subscription is already confirmed on a
+                                            // different live server (an overlapping restore, #3336), or it was
+                                            // retired while the subscribe was in flight (#3375); remove the
+                                            // server-side registration it created, or the server would keep
+                                            // sending messages that are duplicates, or that nothing wants
                                             if (message is Message.CommandChannelBase channelMessage)
                                             {
-                                                var unsubscribe = sub.GetSubscriptionMessage(
-                                                    channelMessage.Channel,
-                                                    ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
-                                                    CommandFlags.FireAndForget,
-                                                    internalCall: true);
-                                                connection.BridgeCouldBeNull?.Multiplexer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                                connection.BridgeCouldBeNull?.Multiplexer.UnsubscribeStray(sub, channelMessage.Channel, ep);
                                             }
                                         }
 
