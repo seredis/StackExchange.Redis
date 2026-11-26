@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Buffers;
-using System.Diagnostics.CodeAnalysis;
-using RESPite;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using RESPite.Buffers;
 
 namespace StackExchange.Redis.Protocol
@@ -28,18 +28,47 @@ namespace StackExchange.Redis.Protocol
         internal const int SlotBits = 31;
         internal const ulong SlotMask = (1UL << SlotBits) - 1;
 
-        private byte[]? _buffer;
+        private object? _buffer;
         private readonly int _start;
         private readonly int _length;
         private readonly ulong _keyMarks;
 
-        internal RespRequestFrame(byte[] buffer, int start, int length, int argCount, int slot, ulong keyMarks, RedisCommand command, int database = -1)
+        private readonly byte[]? Array
+        {
+            get
+            {
+                var buffer = _buffer;
+                if (buffer == null) return null;
+                if (buffer is byte[] array) return array;
+                if (buffer is IMemoryOwner<byte> memoryOwner && MemoryMarshal.TryGetArray((ReadOnlyMemory<byte>)memoryOwner.Memory, out var segment))
+                {
+                    return segment.Array!;
+                }
+                throw new InvalidOperationException();
+            }
+        }
+
+        private RespRequestFrame(object? buffer, int start, int length, int argCount, int slot, ulong keyMarks, RedisCommand command, int database)
         {
             _buffer = buffer;
             _start = start;
             _length = length;
             _keyMarks = keyMarks;
-            ArgCount = argCount;
+            _argCount = argCount;
+            Slot = slot;
+            Command = command;
+            Database = database;
+        }
+
+        internal RespRequestFrame(byte[] buffer, int start, int length, int argCount, int slot, ulong keyMarks, RedisCommand command, int database = -1, bool noReturn = false)
+        {
+            Debug.Assert(argCount >= 0);
+
+            _buffer = buffer;
+            _start = start;
+            _length = length;
+            _keyMarks = keyMarks;
+            _argCount = noReturn ? ~argCount : argCount;
             Slot = slot;
             Command = command;
             Database = database;
@@ -65,8 +94,10 @@ namespace StackExchange.Redis.Protocol
         /// </remarks>
         public int Database { get; }
 
+        private readonly int _argCount;
+
         /// <summary>The number of RESP arguments, including the command itself.</summary>
-        public int ArgCount { get; }
+        public readonly int ArgCount => _argCount < 0 ? ~_argCount : _argCount;
 
         /// <summary>
         /// Which command this is, for everything downstream that has to know WHAT is being sent rather than
@@ -89,8 +120,10 @@ namespace StackExchange.Redis.Protocol
         /// <summary>The combined cluster slot, or <see cref="ServerSelectionStrategy.NoSlot"/>/<see cref="ServerSelectionStrategy.MultipleSlots"/>.</summary>
         public int Slot { get; }
 
+        private readonly bool NoReturn => _argCount < 0;
+
         /// <summary>The rendered frame.</summary>
-        public readonly ReadOnlySpan<byte> Span => new(_buffer, _start, _length);
+        public readonly ReadOnlySpan<byte> Span => new(Array, _start, _length);
 
         /// <summary>True when there were more keys than the inline marks can hold, so recovering them needs a walk.</summary>
         public readonly bool KeysNeedScan => (_keyMarks & OverflowFlag) != 0;
@@ -147,7 +180,7 @@ namespace StackExchange.Redis.Protocol
         /// once per frame should cache the result.
         /// </remarks>
         public readonly int TryGetKeys(scoped Span<KeyRange> target)
-            => ResolveKeys(_buffer!, _start, _length, _keyMarks, target);
+            => ResolveKeys(Array!, _start, _length, _keyMarks, target);
 
         /// <summary>
         /// As <see cref="TryGetKeys"/>, for a caller holding the buffer and marks rather than a frame -
@@ -272,7 +305,7 @@ namespace StackExchange.Redis.Protocol
         }
 
         /// <summary>Resolve a <see cref="KeyRange"/> against the underlying buffer.</summary>
-        public readonly ReadOnlySpan<byte> GetKey(in KeyRange range) => new(_buffer, range.Offset, range.Length);
+        public readonly ReadOnlySpan<byte> GetKey(in KeyRange range) => new(Array, range.Offset, range.Length);
 
         /// <summary>
         /// Given the buffer-absolute offset of a fragment's '$', parse the self-describing length and return
@@ -317,10 +350,18 @@ namespace StackExchange.Redis.Protocol
         internal RespRequest Detach(CommandFlags flags, byte[]? prefix)
         {
             var buffer = _buffer ?? throw new ObjectDisposedException(nameof(RespRequestFrame));
+            var arr = Array;
             _buffer = null; // ownership moves to the lease
+
+            RefCountedBuffer? lease = null;
+            if (!NoReturn)
+            {
+                if (buffer is byte[] array) lease = RefCountedBuffer.Adopt(array, array.Length);
+                else if (buffer is IMemoryOwner<byte> memoryOwner) lease = RefCountedBuffer.Adopt(memoryOwner, _length);
+            }
             return new RespRequest(
-                buffer,
-                RefCountedBuffer.Adopt(buffer, buffer.Length),
+                arr!,
+                lease,
                 _start,
                 _length,
                 _keyMarks,
@@ -356,9 +397,10 @@ namespace StackExchange.Redis.Protocol
         /// <param name="prefix">A frame to write ahead of the request, or null; see <see cref="RespRequest.Prefix"/>.</param>
         internal RespRequest AsLookupKey(CommandFlags flags, byte[]? prefix)
         {
-            var buffer = _buffer ?? throw new ObjectDisposedException(nameof(RespRequestFrame));
+            var array = Array ?? throw new ObjectDisposedException(nameof(RespRequestFrame));
+
             return new RespRequest(
-                buffer,
+                array,
                 lease: null,
                 _start,
                 _length,
@@ -371,12 +413,67 @@ namespace StackExchange.Redis.Protocol
                 prefix);
         }
 
+        internal readonly RespRequestFrame CopyForEval(string script, int requestOffset, int requestHeaderLength)
+        {
+            Debug.Assert(NoReturn);
+            Debug.Assert(Command == RedisCommand.EVALSHA_RO || Command == RedisCommand.EVALSHA);
+
+            var array = Array ?? throw new ObjectDisposedException(nameof(RespRequestFrame));
+
+            var start = _start - requestOffset;
+            var length = _length + requestOffset;
+            var span = new Span<byte>(array, start, length);
+
+            new ReadOnlySpan<byte>(array, _start, requestHeaderLength).CopyTo(span);
+            var offset = requestHeaderLength;
+
+            RedisCommand command;
+            if (Command == RedisCommand.EVALSHA_RO)
+            {
+                command = RedisCommand.EVAL_RO;
+                "$7\r\nEVAL_RO\r\n$"u8.CopyTo(span.Slice(offset));
+                offset += 14;
+            }
+            else
+            {
+                command = RedisCommand.EVAL;
+                "$4\r\nEVAL\r\n$"u8.CopyTo(span.Slice(offset));
+                offset += 11;
+            }
+
+            var scriptValue = new RedisValue(script);
+            var scriptLength = scriptValue.GetByteCount();
+
+            Span<byte> scriptLengthUtf8 = stackalloc byte[10 + 2];
+            var scriptLengthUtf8Written = RespWire.WriteRaw(scriptLengthUtf8, scriptLength);
+
+            scriptLengthUtf8.Slice(0, scriptLengthUtf8Written).CopyTo(span.Slice(offset));
+            offset += scriptLengthUtf8Written;
+
+            scriptValue.CopyTo(span.Slice(offset));
+
+            return new(_buffer, start, length, _argCount, Slot, _keyMarks, command, Database);
+        }
+
+        internal void EnsureDispose()
+        {
+            var buffer = _buffer;
+            _buffer = null;
+
+            if (buffer is byte[] arr) ArrayPool<byte>.Shared.Return(arr);
+            else if (buffer is IMemoryOwner<byte> owner) owner.Dispose();
+        }
+
         /// <summary>Return the underlying buffer to the pool; safe to call more than once.</summary>
         public void Dispose()
         {
             var buffer = _buffer;
             _buffer = null;
-            if (buffer is not null) ArrayPool<byte>.Shared.Return(buffer);
+            if (!NoReturn)
+            {
+                if (buffer is byte[] arr) ArrayPool<byte>.Shared.Return(arr);
+                else if (buffer is IMemoryOwner<byte> owner) owner.Dispose();
+            }
         }
     }
 
