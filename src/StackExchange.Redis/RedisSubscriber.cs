@@ -89,6 +89,31 @@ namespace StackExchange.Redis
         }
 
         /// <summary>
+        /// Gets which server to send a publish for this channel to: the server the channel is subscribed on, unless that
+        /// server does not satisfy the caller's primary/replica demand, in which case <see langword="null"/>, so that
+        /// normal server selection applies.
+        /// </summary>
+        /// <remarks>
+        /// A subscription stays where it was made, even after a role change (a subscription works on a replica too), so the
+        /// server it is on can be a replica by the time of a publish that demands a primary, or vice versa; sending the
+        /// publish there regardless would fail it locally, even though a suitable server is known.
+        /// </remarks>
+        internal ServerEndPoint? GetPublishServer(in RedisChannel channel, CommandFlags flags)
+        {
+            var server = GetSubscribedServer(channel);
+            if (server is not null)
+            {
+                switch (Message.GetPrimaryReplicaFlags(flags))
+                {
+                    case CommandFlags.DemandMaster when server.IsReplica:
+                    case CommandFlags.DemandReplica when !server.IsReplica:
+                        return null;
+                }
+            }
+            return server;
+        }
+
+        /// <summary>
         /// Handler that executes whenever a message comes in, this doles out messages to any registered handlers.
         /// </summary>
         internal void OnMessage(in RedisChannel subscription, in RedisChannel channel, in RedisValue payload)
@@ -237,16 +262,16 @@ namespace StackExchange.Redis
         {
             ThrowIfNull(channel);
             var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
-            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
-            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
+            // if we're actively subscribed: send via that server, if it suits the flags (otherwise, follow normal rules)
+            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetPublishServer(channel, flags));
         }
 
         public Task<long> PublishAsync(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             ThrowIfNull(channel);
             var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
-            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
-            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
+            // if we're actively subscribed: send via that server, if it suits the flags (otherwise, follow normal rules)
+            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetPublishServer(channel, flags));
         }
 
         void ISubscriber.Subscribe(RedisChannel channel, Action<RedisChannel, RedisValue> handler, CommandFlags flags)

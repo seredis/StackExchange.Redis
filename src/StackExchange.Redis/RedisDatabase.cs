@@ -1998,16 +1998,16 @@ namespace StackExchange.Redis
         {
             if (channel.IsNullOrEmpty) throw new ArgumentNullException(nameof(channel));
             var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
-            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
-            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
+            // if we're actively subscribed: send via that server, if it suits the flags (otherwise, follow normal rules)
+            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetPublishServer(channel, flags));
         }
 
         public Task<long> PublishAsync(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             if (channel.IsNullOrEmpty) throw new ArgumentNullException(nameof(channel));
             var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
-            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
-            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
+            // if we're actively subscribed: send via that server, if it suits the flags (otherwise, follow normal rules)
+            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetPublishServer(channel, flags));
         }
 
         public RespResult ExecuteResp(string command, ReadOnlyMemory<RedisKeyOrValue> args, CommandFlags flags = CommandFlags.None)
