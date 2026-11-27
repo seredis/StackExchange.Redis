@@ -66,6 +66,15 @@ namespace StackExchange.Redis
         private ServerType serverType;
         private TracerKeyCache? tracerKeyCache;
         private volatile UnselectableFlags unselectableReasons;
+
+        /// <summary>
+        /// How long a replica that answered <c>LOADING</c> stays out of selection before a command may try it
+        /// again. A reply that proves the server is no longer loading clears this early.
+        /// </summary>
+        internal const int LoadingProbeIntervalMilliseconds = 2000;
+
+        // tick count until which this server is left out of selection because it answered LOADING; 0 means not suppressed
+        private int _loadingSuppressedUntil;
         private Version version;
 
         internal void ResetNonConnected()
@@ -968,8 +977,40 @@ namespace StackExchange.Redis
 
         internal UnselectableFlags GetUnselectableFlags() => unselectableReasons;
 
+        /// <summary>
+        /// Leave this server out of selection until <see cref="LoadingProbeIntervalMilliseconds"/> have passed.
+        /// Refreshed on every <c>LOADING</c> reply, so a replica that is still loading stays out.
+        /// </summary>
+        internal void SuppressWhileLoading()
+        {
+            var until = unchecked(Environment.TickCount + LoadingProbeIntervalMilliseconds);
+            if (until == 0) until = 1; // 0 is the "not suppressed" sentinel
+            Volatile.Write(ref _loadingSuppressedUntil, until);
+        }
+
+        /// <summary>
+        /// The server answered a command it cannot answer while loading, so it can take traffic again.
+        /// </summary>
+        internal void ClearLoadingSuppression()
+        {
+            if (Volatile.Read(ref _loadingSuppressedUntil) != 0)
+            {
+                Volatile.Write(ref _loadingSuppressedUntil, 0);
+            }
+        }
+
+        private bool IsLoadingSuppressed()
+        {
+            var until = Volatile.Read(ref _loadingSuppressedUntil);
+            return until != 0 && unchecked(Environment.TickCount - until) < 0;
+        }
+
         internal bool IsSelectable(RedisCommand command, bool allowDisconnected = false)
         {
+            // a replica that just answered LOADING is connected but cannot serve; skip it until the probe interval
+            // elapses (or a reply proves it has finished loading)
+            if (IsLoadingSuppressed()) return false;
+
             // Until we've connected at least once, we're going to have a DidNotRespond unselectable reason present
             var bridge = unselectableReasons == 0 || (allowDisconnected && unselectableReasons == UnselectableFlags.DidNotRespond)
                 ? GetBridge(command, true)
