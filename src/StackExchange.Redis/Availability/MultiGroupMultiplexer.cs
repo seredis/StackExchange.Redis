@@ -1371,6 +1371,18 @@ namespace StackExchange.Redis
 
             public Task<bool> ConfigureAsync(TextWriter? log = null) => Active.ConfigureAsync(log);
 
+            public async Task<int> ReauthenticateAsync(ReauthenticateOptions options = ReauthenticateOptions.None, CommandFlags flags = CommandFlags.None)
+            {
+                // credentials rotate for the deployment as a whole, so refresh every member,
+                // not just the active one - a stale standby would otherwise fail over unauthenticated
+                int total = 0;
+                foreach (var member in _members)
+                {
+                    total += await member.Multiplexer.ReauthenticateAsync(options, flags).ForAwait();
+                }
+                return total;
+            }
+
             public bool Configure(TextWriter? log = null) => Active.Configure(log);
 
             public string GetStatus() => Active.GetStatus();

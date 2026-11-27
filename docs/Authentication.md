@@ -64,6 +64,49 @@ await options.ConfigureForAzureWithUserAssignedManagedIdentityAsync(managedIdent
 
 For details and samples see [https://github.com/Azure/Microsoft.Azure.StackExchangeRedis](https://github.com/Azure/Microsoft.Azure.StackExchangeRedis)
 
+## Rotating credentials on a live connection
+
+Token-based authentication (such as Entra ID) means credentials that *expire*; some servers (Azure Managed Redis,
+for example) retire the authentication of long-lived connections unless they re-authenticate in time. Two things
+are needed to keep a multiplexer healthy across rotation:
+
+1. Update `User` / `Password` on the same `ConfigurationOptions` instance that was used to connect; the multiplexer
+   reads it live, so any later *reconnect* automatically authenticates with the current values.
+2. Call `ReauthenticateAsync()` on the multiplexer, which re-issues `AUTH` with those credentials on every
+   *established* connection - including dedicated subscription connections, which cannot be reached via
+   `IServer` commands (those always target the interactive connection):
+
+``` csharp
+options.Password = await GetFreshTokenAsync();
+await muxer.ReauthenticateAsync();
+```
+
+One caveat: a RESP2 connection with active subscriptions is in subscriber mode, which rejects `AUTH`; by
+default such connections are skipped, and instead rely on the server disconnecting them when their
+authentication lapses (the automatic reconnect then picks up the updated credentials). Under RESP3 - the
+default where supported - subscription connections are re-authenticated in place, avoiding that gap.
+
+If the server *enforces* credential expiry on established connections (vanilla Redis password rotation does
+not; token-enforcing services do), waiting for that disconnect means losing publications at a moment of the
+server's choosing. `ReauthenticateOptions.AllowReconnect` opts into recycling such connections proactively
+instead - an immediate reconnect that authenticates with the fresh credentials and restores the subscriptions,
+trading a brief, *controlled* interruption for the uncontrolled one:
+
+``` csharp
+await muxer.ReauthenticateAsync(ReauthenticateOptions.AllowReconnect);
+```
+
+### Existing ad-hoc `AUTH` callers
+
+Code written before this API typically rotates credentials with an ad-hoc command per server -
+`server.Execute("AUTH", user, password)` - which only ever reaches the interactive connection. The library now
+recognises an ad-hoc `AUTH` issued against an `IServer` and automatically shadows it onto that server's
+dedicated subscription connection wherever `ReauthenticateAsync` would have re-authenticated it in place
+(RESP3, or RESP2 without active subscriptions), so such callers get the subscription-connection refresh without
+code changes. The shadow is best-effort: the caller's result reflects only their own command, and the RESP2
+subscriber-mode gap above still applies - `ReauthenticateAsync` with `AllowReconnect` remains the complete
+answer.
+
 ## Client certificates
 
 If the server is configured to require a client certificate, this can be supplied in multiple ways.

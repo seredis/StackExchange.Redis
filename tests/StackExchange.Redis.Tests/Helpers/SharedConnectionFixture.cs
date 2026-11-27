@@ -163,6 +163,8 @@ public class SharedConnectionFixture : IDisposable
 
         public Task<bool> ConfigureAsync(TextWriter? log = null) => _inner.ConfigureAsync(log);
 
+        public Task<int> ReauthenticateAsync(ReauthenticateOptions options = ReauthenticateOptions.None, CommandFlags flags = CommandFlags.None) => _inner.ReauthenticateAsync(options, flags);
+
         public void Dispose() { } // DO NOT call _inner.Dispose();
 
         public ValueTask DisposeAsync() => default; // DO NOT call _inner.DisposeAsync();
