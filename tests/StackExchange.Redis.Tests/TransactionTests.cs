@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Linq;
 using System.Threading.Tasks;
+using StackExchange.Redis.Profiling;
 using Xunit;
 
 namespace StackExchange.Redis.Tests;
@@ -32,6 +34,64 @@ public class TransactionTests(ITestOutputHelper output, SharedConnectionFixture 
         var tran = db.CreateTransaction();
         var redisTransaction = Assert.IsType<RedisTransaction>(tran);
         Assert.Throws<NotSupportedException>(() => redisTransaction.CreateTransaction(null));
+    }
+
+    [Fact]
+    public async Task PrimaryOnlyWorkWithPreferReplicaRunsOnThePrimary()
+    {
+        await using var conn = Create(configuration: TestConfig.Current.PrimaryServerAndPort + "," + TestConfig.Current.ReplicaServerAndPort);
+        Assert.SkipUnless(
+            conn.GetEndPoints().Any(ep => conn.GetServer(ep).IsReplica),
+            "No replica in this configuration");
+
+        var db = conn.GetDatabase();
+        RedisKey key = Me();
+        db.StringSet(key, "abc");
+
+        var session = new ProfilingSession();
+        conn.RegisterProfiler(() => session);
+
+        // this is what LockExtend / LockRelease fall back to on servers without SET IFEQ / DELEX
+        var tran = db.CreateTransaction();
+        tran.AddCondition(Condition.StringEqual(key, "abc"));
+        var expire = tran.KeyExpireAsync(key, TimeSpan.FromMinutes(1));
+        Assert.True(tran.Execute(CommandFlags.PreferReplica));
+        Assert.True(await expire);
+
+        tran = db.CreateTransaction();
+        tran.AddCondition(Condition.StringEqual(key, "abc"));
+        var set = tran.StringSetAsync(key, "def");
+        Assert.True(await tran.ExecuteAsync(CommandFlags.PreferReplica));
+        Assert.True(await set);
+
+        Assert.Equal("def", db.StringGet(key, CommandFlags.DemandMaster));
+        var execs = session.FinishProfiling().Where(cmd => cmd.Command == "EXEC").ToList();
+        Assert.Equal(2, execs.Count);
+        Assert.All(execs, exec => Assert.False(conn.GetServer(exec.EndPoint).IsReplica));
+    }
+
+    [Fact]
+    public async Task ReadOnlyWorkWithPreferReplicaStillRunsOnTheReplica()
+    {
+        await using var conn = Create(configuration: TestConfig.Current.PrimaryServerAndPort + "," + TestConfig.Current.ReplicaServerAndPort);
+        Assert.SkipUnless(
+            conn.GetEndPoints().Any(ep => conn.GetServer(ep).IsReplica),
+            "No replica in this configuration");
+
+        var db = conn.GetDatabase();
+        RedisKey key = Me();
+
+        var session = new ProfilingSession();
+        conn.RegisterProfiler(() => session);
+
+        var tran = db.CreateTransaction();
+        tran.AddCondition(Condition.KeyNotExists(key));
+        var get = tran.StringGetAsync(key);
+        Assert.True(await tran.ExecuteAsync(CommandFlags.PreferReplica));
+        Assert.True((await get).IsNull);
+
+        var exec = Assert.Single(session.FinishProfiling(), cmd => cmd.Command == "EXEC");
+        Assert.True(conn.GetServer(exec.EndPoint).IsReplica);
     }
 
     [Theory]

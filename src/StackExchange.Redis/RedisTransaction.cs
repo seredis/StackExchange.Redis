@@ -266,6 +266,22 @@ namespace StackExchange.Redis
             {
                 InnerOperations = (operations?.Count > 0) ? operations.ToArray() : Array.Empty<QueuedMessage>();
                 this.conditions = (conditions?.Count > 0) ? conditions.ToArray() : Array.Empty<ConditionResult>();
+
+                // the whole transaction runs on one server, so if any operation in it is primary-only, the transaction
+                // has to go to the primary as well, the same way Message.SetPrimaryOnly does for a single command;
+                // otherwise PreferReplica picks a replica that rejects the operation (DemandReplica is left alone so that
+                // it still fails the same way)
+                if (GetPrimaryReplicaFlags(Flags) != CommandFlags.DemandReplica)
+                {
+                    foreach (var op in InnerOperations)
+                    {
+                        if (op.Wrapped.IsPrimaryOnly())
+                        {
+                            SetPrimaryOnly();
+                            break;
+                        }
+                    }
+                }
             }
 
             internal override void SetExceptionAndComplete(Exception exception, PhysicalConnection? connection)
