@@ -108,7 +108,7 @@ namespace StackExchange.Redis
         /// <param name="channel">The <see cref="RedisChannel"/> to determine a slot ID for.</param>
         public int HashSlot(in RedisChannel channel)
         {
-            if (ServerType == ServerType.Standalone || channel.IsNull) return NoSlot;
+            if (ServerType == ServerType.Standalone || channel.IsNull || channel.IsMultiNode) return NoSlot;
 
             ReadOnlySpan<byte> routingSpan = channel.RoutingSpan;
             byte[] prefix;

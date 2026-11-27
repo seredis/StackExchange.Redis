@@ -1241,6 +1241,8 @@ namespace StackExchange.Redis
 
             public int HashSlot(RedisKey key) => Active.HashSlot(key);
 
+            public int HashSlot(RedisChannel channel) => Active.HashSlot(channel);
+
             private ISubscriber? _defaultSubscriber;
 
             public ISubscriber GetSubscriber(object? asyncState = null)

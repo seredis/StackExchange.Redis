@@ -195,6 +195,8 @@ public class SharedConnectionFixture : IDisposable
 
         public int HashSlot(RedisKey key) => _inner.HashSlot(key);
 
+        public int HashSlot(RedisChannel channel) => _inner.HashSlot(channel);
+
         public long PublishReconfigure(CommandFlags flags = CommandFlags.None) => _inner.PublishReconfigure(flags);
 
         public Task<long> PublishReconfigureAsync(CommandFlags flags = CommandFlags.None) => _inner.PublishReconfigureAsync(flags);

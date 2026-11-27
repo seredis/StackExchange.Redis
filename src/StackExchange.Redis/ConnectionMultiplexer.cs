@@ -1536,7 +1536,23 @@ namespace StackExchange.Redis
         /// Compute the hash-slot of a specified key.
         /// </summary>
         /// <param name="key">The key to get a hash slot ID for.</param>
+        [OverloadResolutionPriority(1)] // strings and byte arrays convert implicitly to both RedisKey and RedisChannel; keep binding them to this one
         public int HashSlot(RedisKey key) => ServerSelectionStrategy.HashSlot(key);
+
+        /// <summary>
+        /// Compute the hash-slot of a specified channel, as used by this client to route it in a cluster; this accounts
+        /// for <see cref="ConfigurationOptions.ChannelPrefix"/>, and for key-routed channels (such as
+        /// <see cref="RedisChannel.KeySpaceSingleKey(in RedisKey, int)"/>) being routed by their key.
+        /// </summary>
+        /// <param name="channel">The channel to get a hash slot ID for.</param>
+        /// <remarks>
+        /// This reflects the slot this client routes the channel to (including plain literal and pattern channels,
+        /// where it determines which node the client subscribes on), rather than a server-side slot constraint.
+        /// Returns <c>-1</c> when not connected to a cluster or for multi-node channels (such as
+        /// <see cref="RedisChannel.KeySpacePattern(in RedisKey, int?)"/> and
+        /// <see cref="RedisChannel.KeySpacePrefix(in RedisKey, int?)"/>), which are subscribed on every node.
+        /// </remarks>
+        public int HashSlot(RedisChannel channel) => ServerSelectionStrategy.HashSlot(channel);
 
         internal ServerEndPoint? AnyServer(ServerType serverType, uint startOffset, RedisCommand command, CommandFlags flags, bool allowDisconnected)
         {

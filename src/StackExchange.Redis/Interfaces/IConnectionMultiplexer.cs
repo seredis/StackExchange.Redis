@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using StackExchange.Redis.Availability;
 using StackExchange.Redis.Maintenance;
@@ -179,7 +180,23 @@ public interface IConnectionMultiplexer : IDisposable, IAsyncDisposable
     /// Compute the hash-slot of a specified key.
     /// </summary>
     /// <param name="key">The key to get a slot ID for.</param>
+    [OverloadResolutionPriority(1)] // strings and byte arrays convert implicitly to both RedisKey and RedisChannel; keep binding them to this one
     int HashSlot(RedisKey key);
+
+    /// <summary>
+    /// Compute the hash-slot of a specified channel, as used by this client to route it in a cluster; this accounts
+    /// for <see cref="ConfigurationOptions.ChannelPrefix"/>, and for key-routed channels (such as
+    /// <see cref="RedisChannel.KeySpaceSingleKey(in RedisKey, int)"/>) being routed by their key.
+    /// </summary>
+    /// <param name="channel">The channel to get a slot ID for.</param>
+    /// <remarks>
+    /// This reflects the slot this client routes the channel to (including plain literal and pattern channels,
+    /// where it determines which node the client subscribes on), rather than a server-side slot constraint.
+    /// Returns <c>-1</c> when not connected to a cluster or for multi-node channels (such as
+    /// <see cref="RedisChannel.KeySpacePattern(in RedisKey, int?)"/> and
+    /// <see cref="RedisChannel.KeySpacePrefix(in RedisKey, int?)"/>), which are subscribed on every node.
+    /// </remarks>
+    int HashSlot(RedisChannel channel);
 
     /// <summary>
     /// Obtain a pub/sub subscriber connection to the specified server.
