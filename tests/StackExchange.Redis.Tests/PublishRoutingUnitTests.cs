@@ -57,12 +57,13 @@ public class PublishRoutingUnitTests(ITestOutputHelper log)
     private static async Task SwapRolesAndWaitForClientAsync(RecordingServer server, ConnectionMultiplexer conn)
     {
         server.SwapRoles();
-        await conn.ConfigureAsync();
 
+        // ConfigureAsync is a no-op (returning false) while another reconfigure is in flight, so keep asking
         var timer = Stopwatch.StartNew();
         while (!(conn.GetServer(server.DefaultEndPoint).IsReplica && !conn.GetServer(server.Replica).IsReplica))
         {
             if (timer.Elapsed > TimeSpan.FromSeconds(10)) Assert.Fail("the client did not see the role change");
+            await conn.ConfigureAsync();
             await Task.Delay(50);
         }
     }
