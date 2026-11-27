@@ -28,12 +28,22 @@ public class ReauthenticateTests(ITestOutputHelper log)
         /// </summary>
         public int SubscriberAuthCommands => Volatile.Read(ref _subscriberAuthCommands);
 
+        /// <summary>
+        /// Refuse <c>AUTH</c> on connections with live subscriptions, to simulate the subscription connection's
+        /// refresh failing while the interactive one succeeds.
+        /// </summary>
+        public bool RejectSubscriberAuth { get; set; }
+
         public override TypedRedisValue Execute(RedisClient client, in RedisRequest request)
         {
             if (request.Count > 0 && string.Equals(request.GetString(0), "auth", StringComparison.OrdinalIgnoreCase))
             {
                 Interlocked.Increment(ref _authCommands);
-                if (client.IsSubscriber) Interlocked.Increment(ref _subscriberAuthCommands);
+                if (client.IsSubscriber)
+                {
+                    Interlocked.Increment(ref _subscriberAuthCommands);
+                    if (RejectSubscriberAuth) return TypedRedisValue.Error("ERR simulated AUTH failure");
+                }
             }
             return base.Execute(client, in request);
         }
@@ -42,7 +52,8 @@ public class ReauthenticateTests(ITestOutputHelper log)
     private async Task<(AuthCountingServer Server, ConnectionMultiplexer Connection)> ConnectAsync(
         RedisProtocol protocol,
         bool sharedSubscriptionConnection = false,
-        bool withPassword = true)
+        bool withPassword = true,
+        CapturingLogger? logs = null)
     {
         var server = new AuthCountingServer(log);
         if (withPassword) server.Password = Password;
@@ -50,6 +61,7 @@ public class ReauthenticateTests(ITestOutputHelper log)
         config.Protocol = protocol;
         config.SharedSubscriptionConnection = sharedSubscriptionConnection;
         if (withPassword) config.Password = Password;
+        if (logs is not null) config.LoggerFactory = logs;
         var conn = await ConnectionMultiplexer.ConnectAsync(config);
         return (server, conn);
     }
@@ -193,6 +205,31 @@ public class ReauthenticateTests(ITestOutputHelper log)
             Assert.Equal(2, server.AuthCommands - before);
             Assert.Equal(1, server.SubscriberAuthCommands);
             await AssertDeliversAsync(conn, channel, received); // the subscription survived
+        }
+    }
+
+    [Fact]
+    public async Task FailedMirroredAuthIsLogged()
+    {
+        // the caller only sees the interactive connection's reply, so a failure on the subscription
+        // connection must surface via the logger rather than vanish
+        var logs = new CapturingLogger();
+        var (server, conn) = await ConnectAsync(RedisProtocol.Resp3, logs: logs);
+        using (server)
+        await using (conn)
+        {
+            var (channel, received) = await SubscribeAndVerifyAsync(conn);
+            server.RejectSubscriberAuth = true;
+
+            var result = await conn.GetServer(conn.GetEndPoints()[0]).ExecuteAsync("AUTH", Password);
+            Assert.Equal("OK", result.ToString());
+
+            const string Fragment = "could not be applied to the subscription connection";
+            Assert.True(
+                await Poll.UntilAsync(() => logs.Matching(Fragment).Count > 0),
+                "expected the failed mirrored AUTH to be logged; got:\n" + logs.All);
+            Assert.Single(logs.Matching(Fragment));
+            await AssertDeliversAsync(conn, channel, received); // a rejected AUTH leaves the subscription intact
         }
     }
 

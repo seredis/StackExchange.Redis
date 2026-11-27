@@ -1183,7 +1183,23 @@ namespace StackExchange.Redis
                 var shadow = new RedisDatabase.ExecuteMessage(multiplexer.CommandMap, -1, flags, command, args);
                 shadow.SetInternalCall();
                 shadow.SetForSubscriptionBridge();
-                multiplexer.ExecuteAsyncImpl(shadow, ResultProcessor.DemandOK, state: null, server, defaultValue: false).ObserveErrors();
+                var pending = multiplexer.ExecuteAsyncImpl(shadow, ResultProcessor.DemandOK, state: null, server, defaultValue: false);
+                if (multiplexer.Logger is not null)
+                {
+                    // the caller only sees the interactive connection's reply, so make a failure here visible somewhere
+                    pending.ContinueWith(
+                        static (t, s) =>
+                        {
+                            var ep = (ServerEndPoint)s!;
+                            ep.Multiplexer.Logger?.LogWarningMirroredAuthFailed(t.Exception!.InnerException ?? t.Exception, new(ep));
+                        },
+                        server,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+                }
+                else
+                {
+                    pending.ObserveErrors();
+                }
             }
         }
 

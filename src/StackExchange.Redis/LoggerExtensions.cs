@@ -863,4 +863,10 @@ internal static partial class LoggerExtensions
         EventId = 130,
         Message = "Lag-aware health check could not ask {RestEndpoint}: {Reason}")]
     internal static partial void LogWarningLagAwareInconclusive(this ILogger logger, string restEndpoint, string reason);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        EventId = 141,
+        Message = "{Server}: AUTH issued via IServer.Execute could not be applied to the subscription connection; it will authenticate with the configured credentials when it next reconnects")]
+    internal static partial void LogWarningMirroredAuthFailed(this ILogger logger, Exception exception, ServerEndPointLogValue server);
 }
