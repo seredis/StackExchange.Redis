@@ -1,4 +1,5 @@
 using System;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using StackExchange.Redis.Server;
@@ -19,20 +20,20 @@ public class LoadingReplicaRerouteTests(ITestOutputHelper log)
         private readonly Server.RedisServer.Node _primary;
         private readonly Server.RedisServer.Node _replicaA;
         private readonly Server.RedisServer.Node _replicaB;
-        private int _replicaALoading;
-        private int _replicaBLoading;
         private int _primaryGets;
         private int _replicaGets;
+
+        public EndPoint ReplicaA { get; }
 
         public PrimaryAndReplicasServer(ITestOutputHelper log)
             : base(log)
         {
-            var replicaA = AddEmptyNode();
+            ReplicaA = AddEmptyNode();
             var replicaB = AddEmptyNode();
-            SetReplicaOf(replicaA, DefaultEndPoint);
+            SetReplicaOf(ReplicaA, DefaultEndPoint);
             SetReplicaOf(replicaB, DefaultEndPoint);
             Assert.True(TryGetNode(DefaultEndPoint, out _primary!));
-            Assert.True(TryGetNode(replicaA, out _replicaA!));
+            Assert.True(TryGetNode(ReplicaA, out _replicaA!));
             Assert.True(TryGetNode(replicaB, out _replicaB!));
         }
 
@@ -42,18 +43,14 @@ public class LoadingReplicaRerouteTests(ITestOutputHelper log)
 
         public void SetReplicasLoading(bool loading)
         {
-            Volatile.Write(ref _replicaALoading, loading ? 1 : 0);
-            Volatile.Write(ref _replicaBLoading, loading ? 1 : 0);
+            _replicaA.IsLoading = loading;
+            _replicaB.IsLoading = loading;
         }
 
         public override TypedRedisValue Execute(RedisClient client, in RedisRequest request)
         {
-            if (NodeIsLoading(client.Node))
-            {
-                return TypedRedisValue.Error("LOADING Redis is loading the dataset in memory");
-            }
-
-            if (request.KnownCommand == RedisCommand.GET)
+            var result = base.Execute(client, in request);
+            if (request.KnownCommand == RedisCommand.GET && !result.IsError)
             {
                 if (ReferenceEquals(client.Node, _primary))
                 {
@@ -65,12 +62,8 @@ public class LoadingReplicaRerouteTests(ITestOutputHelper log)
                 }
             }
 
-            return base.Execute(client, in request);
+            return result;
         }
-
-        private bool NodeIsLoading(Server.RedisServer.Node? node)
-            => (ReferenceEquals(node, _replicaA) && Volatile.Read(ref _replicaALoading) != 0)
-               || (ReferenceEquals(node, _replicaB) && Volatile.Read(ref _replicaBLoading) != 0);
     }
 
     [Fact]
@@ -104,6 +97,12 @@ public class LoadingReplicaRerouteTests(ITestOutputHelper log)
         // the loading replicas stay out of selection; this read does not touch them
         Assert.Equal(replicaGetsAfterReroute, server.ReplicaGets);
         Assert.True(server.PrimaryGets > primaryGetsAfterReroute);
+
+        // INFO is served while loading, and a successful INFO must not make the replica selectable again
+        var info = await conn.GetServer(server.ReplicaA).InfoAsync("replication");
+        Assert.Contains(info, static section => section.Key.Equals("Replication", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("from-primary", await db.StringGetAsync(key, CommandFlags.PreferReplica));
+        Assert.Equal(replicaGetsAfterReroute, server.ReplicaGets);
 
         server.SetReplicasLoading(false);
 
