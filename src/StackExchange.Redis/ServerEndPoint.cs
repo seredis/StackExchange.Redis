@@ -993,9 +993,12 @@ namespace StackExchange.Redis
         /// </summary>
         internal void ClearLoadingSuppression()
         {
-            if (Volatile.Read(ref _loadingSuppressedUntil) != 0)
+            // The common case is "not suppressed", so the read stays in front of any interlocked operation.
+            // Exchange only against the value just observed: a newer LOADING deadline stored in between must survive.
+            var observed = Volatile.Read(ref _loadingSuppressedUntil);
+            if (observed != 0)
             {
-                Volatile.Write(ref _loadingSuppressedUntil, 0);
+                Interlocked.CompareExchange(ref _loadingSuppressedUntil, 0, observed);
             }
         }
 
