@@ -288,6 +288,13 @@ namespace StackExchange.Redis
             var copy = reader;
             if (SetResultCore(connection, message, ref reader))
             {
+                // INFO / CONFIG / HELLO succeed while a server is still LOADING, so only a command the server
+                // refuses in that state is evidence that it can take traffic again
+                if (ProvesNotLoading(message.Command))
+                {
+                    bridge?.ServerEndPoint?.ClearLoadingSuppression();
+                }
+
                 bridge?.Multiplexer.Trace("Completed with success: " + copy.GetOverview() + " (" + GetType().Name + ")", ToString());
             }
             else
@@ -402,6 +409,16 @@ namespace StackExchange.Redis
                 }
             }
 
+            // a replica answering LOADING is connected but cannot serve. Take it out of selection and, when this
+            // command was willing to run elsewhere, write it there. Each further LOADING reply does the same, so
+            // a PreferReplica read walks every loading replica and then the primary. A loading primary is left
+            // selectable: it is the only legal target for a write, and the error still surfaces.
+            if (errorKind == RedisErrorKind.Loading && server is not null
+                && TryReissueAwayFromLoadingReplica(message, server))
+            {
+                return false;
+            }
+
             if (string.IsNullOrWhiteSpace(err))
             {
                 err = reader.ReadString()!;
@@ -422,6 +439,81 @@ namespace StackExchange.Redis
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Commands Redis accepts while it is loading the dataset. A successful reply to one of these does not
+        /// mean the server can serve user traffic.
+        /// </summary>
+        private static bool ProvesNotLoading(RedisCommand command) => command switch
+        {
+            RedisCommand.AUTH
+                or RedisCommand.HELLO
+                or RedisCommand.INFO
+                or RedisCommand.CONFIG
+                or RedisCommand.REPLICAOF
+                or RedisCommand.SLAVEOF
+                or RedisCommand.COMMAND
+                or RedisCommand.SHUTDOWN
+                or RedisCommand.DEBUG => false,
+            _ => true,
+        };
+
+        private static bool CanReissueAfterLoading(Message message)
+        {
+            // internal and NoRedirect commands (heartbeats, handshake, commands queued inside a transaction)
+            // stay on the server that answered; the transaction commands themselves must not be split across nodes
+            if (message.IsInternalCall || message is IMultiMessage) return false;
+            if ((message.Flags & CommandFlags.NoRedirect) != 0) return false;
+            switch (message.Command)
+            {
+                case RedisCommand.MULTI:
+                case RedisCommand.EXEC:
+                case RedisCommand.DISCARD:
+                case RedisCommand.WATCH:
+                case RedisCommand.UNWATCH:
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        /// <summary>
+        /// Marks a replica that answered <c>LOADING</c> and writes <paramref name="message"/> to the next server
+        /// selection would choose now that this one is skipped.
+        /// </summary>
+        /// <returns><c>true</c> when the message was written elsewhere and must not be completed from this reply.</returns>
+        private static bool TryReissueAwayFromLoadingReplica(Message message, ServerEndPoint server)
+        {
+            if (!server.IsReplica) return false;
+
+            server.SuppressWhileLoading();
+            if (!CanReissueAfterLoading(message)) return false;
+
+            ServerEndPoint? next;
+            try
+            {
+                next = server.Multiplexer.SelectServer(message);
+            }
+            catch (Exception ex)
+            {
+                server.Multiplexer.Trace("Unable to reissue after LOADING: " + ex.Message);
+                return false;
+            }
+
+            if (next is null || ReferenceEquals(next, server)) return false;
+
+            message.SetResponseReceived();
+            message.PrepareToResend(next, false);
+#pragma warning disable CS0618 // Type or member is obsolete - same path MOVED uses to reissue from the read loop
+            var written = next.TryWriteSync(message) == WriteResult.Success;
+#pragma warning restore CS0618
+            if (written)
+            {
+                server.Multiplexer.Trace(message.Command + " re-issued after LOADING to " + next, "LOADING");
+            }
+
+            return written;
         }
 
         protected abstract bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader);

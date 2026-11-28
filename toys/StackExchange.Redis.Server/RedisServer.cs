@@ -544,14 +544,32 @@ namespace StackExchange.Redis.Server
         public string Password { get; set; } = "";
 
         /// <summary>
-        /// When set, every command is rejected with a <c>LOADING</c> error, mimicking a server that is
-        /// still loading its dataset into memory.
+        /// When set, commands are rejected with <c>LOADING</c>, mimicking a server that is still loading
+        /// its dataset into memory. The commands Redis still answers in that state are allowed through;
+        /// see <see cref="IsAllowedWhileLoading"/>. Applies to every node. A single node can be loading
+        /// on its own via <see cref="Node.IsLoading"/>.
         /// </summary>
         public bool IsLoading { get; set; }
 
+        /// <summary>
+        /// Commands Redis accepts while loading the dataset (<c>CMD_LOADING</c>). Kept in step with
+        /// <c>ProvesNotLoading</c> in the client: a successful reply to one of these must not be treated
+        /// as the server being ready for user traffic.
+        /// </summary>
+        internal static bool IsAllowedWhileLoading(RedisCommand command) => command is
+            RedisCommand.AUTH
+            or RedisCommand.HELLO
+            or RedisCommand.INFO
+            or RedisCommand.CONFIG
+            or RedisCommand.REPLICAOF
+            or RedisCommand.SLAVEOF
+            or RedisCommand.COMMAND
+            or RedisCommand.SHUTDOWN
+            or RedisCommand.DEBUG;
+
         public override TypedRedisValue Execute(RedisClient client, in RedisRequest request)
         {
-            if (IsLoading)
+            if ((IsLoading || client.Node is { IsLoading: true }) && !IsAllowedWhileLoading(request.KnownCommand))
             {
                 return TypedRedisValue.Error("LOADING");
             }
@@ -1328,6 +1346,13 @@ namespace StackExchange.Redis.Server
             private readonly RedisServer _server;
             public RedisServer Server => _server;
             public NodeFlags Flags { get; internal set; }
+
+            /// <summary>
+            /// When set, this node rejects commands with <c>LOADING</c>, except the ones Redis still answers
+            /// while it is loading the dataset. Independent of <see cref="RedisServer.IsLoading"/>, which
+            /// applies to every node.
+            /// </summary>
+            public bool IsLoading { get; set; }
             public Node(RedisServer server, EndPoint endpoint, NodeFlags flags)
             {
                 Host = GetHost(endpoint, out var port);
