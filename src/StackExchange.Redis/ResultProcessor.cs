@@ -447,15 +447,15 @@ namespace StackExchange.Redis
         /// </summary>
         private static bool ProvesNotLoading(RedisCommand command) => command switch
         {
-            RedisCommand.AUTH => false,
-            RedisCommand.HELLO => false,
-            RedisCommand.INFO => false,
-            RedisCommand.CONFIG => false,
-            RedisCommand.REPLICAOF => false,
-            RedisCommand.SLAVEOF => false,
-            RedisCommand.COMMAND => false,
-            RedisCommand.SHUTDOWN => false,
-            RedisCommand.DEBUG => false,
+            RedisCommand.AUTH
+                or RedisCommand.HELLO
+                or RedisCommand.INFO
+                or RedisCommand.CONFIG
+                or RedisCommand.REPLICAOF
+                or RedisCommand.SLAVEOF
+                or RedisCommand.COMMAND
+                or RedisCommand.SHUTDOWN
+                or RedisCommand.DEBUG => false,
             _ => true,
         };
 
