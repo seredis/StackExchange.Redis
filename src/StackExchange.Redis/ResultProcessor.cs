@@ -541,6 +541,28 @@ namespace StackExchange.Redis
             private ConnectionMultiplexer.Subscription? Subscription { get; }
             public TrackSubscriptionsProcessor(ConnectionMultiplexer.Subscription? sub) => Subscription = sub;
 
+            public override bool SetResult(PhysicalConnection connection, Message message, ref RespReader reader)
+            {
+                // When the server replies with an error (e.g. BUSY, LOADING) to an unsubscribe of a retired
+                // subscription, mark it for retry on the next heartbeat/restore pass. This runs on every reply,
+                // including fire-and-forget unsubscribes that have no caller observing a task.
+                if (Subscription is { IsRetired: true } retired
+                    && message is Message.CommandChannelBase { Channel: var channel }
+                    && message.Command is RedisCommand.UNSUBSCRIBE or RedisCommand.PUNSUBSCRIBE or RedisCommand.SUNSUBSCRIBE)
+                {
+                    var copy = reader;
+                    copy.MovePastBof();
+                    if (copy.IsError && connection.BridgeCouldBeNull is { ServerEndPoint: { } ep, Multiplexer: { } muxer })
+                    {
+                        retired.RecordRetiringEndpoint(ep);
+                        retired.MarkUnsubscribeRetryNeeded();
+                        muxer.TrackRetiringSubscription(retired, channel);
+                    }
+                }
+
+                return base.SetResult(connection, message, ref reader);
+            }
+
             protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
                 if (reader.IsAggregate)
@@ -569,25 +591,89 @@ namespace StackExchange.Redis
                                     case RedisCommand.PSUBSCRIBE:
                                         if (Subscription is { } sub && !sub.TryAdoptEndpoint(ep))
                                         {
-                                            // the subscription is already confirmed on a different live server:
-                                            // this ack is a stray from an overlapping restore (#3336); remove
-                                            // the server-side registration it created, or it would deliver
-                                            // duplicate messages indefinitely (fire-and-forget: we are on the
-                                            // read loop, so we must not block)
-                                            if (message is Message.CommandChannelBase channelMessage)
+                                            // the subscription is either retired (unsubscribed while this subscribe
+                                            // was in flight) or already confirmed on a different live server (stray
+                                            // from an overlapping restore, #3336); remove the server-side registration
+                                            // it created, or it would deliver stray/duplicate messages indefinitely
+                                            // (fire-and-forget: we are on the read loop, so we must not block)
+                                            if (message is Message.CommandChannelBase channelMessage
+                                                && connection.BridgeCouldBeNull?.Multiplexer is { } muxer)
                                             {
-                                                var unsubscribe = sub.GetSubscriptionMessage(
-                                                    channelMessage.Channel,
-                                                    ConnectionMultiplexer.SubscriptionAction.Unsubscribe,
-                                                    CommandFlags.FireAndForget,
-                                                    internalCall: true);
-                                                connection.BridgeCouldBeNull?.Multiplexer.ExecuteSyncImpl(unsubscribe, this, ep);
+                                                if (sub.IsRetired)
+                                                {
+                                                    muxer.TrackRetiringSubscription(sub, channelMessage.Channel);
+                                                    if (!sub.TryConsumePendingUnsubscribe(ep))
+                                                    {
+                                                        // No unsubscribe was queued behind this in-flight subscribe;
+                                                        // issue it now (if one *was* queued, skip sending a duplicate
+                                                        // and rely on SetResult / ObserveUnsubscribeFault should it fail).
+                                                        muxer.TryUnsubscribeRetiringServer(sub, channelMessage.Channel, ep);
+                                                        if (!sub.IsConnectedAny())
+                                                        {
+                                                            muxer.UntrackRetiringSubscription(sub);
+                                                        }
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    // Stray registration on ep for a live subscription confirmed on
+                                                    // another server (#3336 / #3375 item 3): track it as a retired
+                                                    // single-node record so that if ep declines the unsubscribe (e.g.
+                                                    // BUSY), the heartbeat/restore path retries it until confirmed.
+                                                    var stray = new ConnectionMultiplexer.SingleNodeSubscription(CommandFlags.None);
+                                                    stray.TryAdoptEndpoint(ep);
+                                                    stray.MarkRetired();
+                                                    muxer.TrackRetiringSubscription(stray, channelMessage.Channel);
+                                                    muxer.TryUnsubscribeRetiringServer(stray, channelMessage.Channel, ep);
+                                                    if (!stray.IsConnectedAny())
+                                                    {
+                                                        muxer.UntrackRetiringSubscription(stray);
+                                                    }
+                                                }
                                             }
                                         }
 
                                         break;
                                     default:
-                                        Subscription?.TryRemoveEndpoint(ep);
+                                        if (Subscription is { } unsub)
+                                        {
+                                            unsub.TryRemoveEndpoint(ep);
+                                            var unsubMuxer = connection.BridgeCouldBeNull?.Multiplexer;
+                                            if (unsubMuxer is not null)
+                                            {
+                                                if (unsub.IsRetired && !unsub.IsConnectedAny())
+                                                {
+                                                    unsubMuxer.UntrackRetiringSubscription(unsub);
+                                                }
+
+                                                // Self-correcting unsubscribe: if an older/retired subscription's
+                                                // UNSUBSCRIBE landed on ep after a newer active subscription for the
+                                                // same channel moved onto ep (e.g. via a restore), the server has now
+                                                // dropped the channel while the active subscription still thinks it is
+                                                // on ep. Clear ep from active and re-subscribe it (fire-and-forget: we
+                                                // are on the read loop, so we must not block).
+                                                if (message is Message.CommandChannelBase unsubChannelMessage
+                                                    && unsubMuxer.TryGetSubscription(unsubChannelMessage.Channel, out var active)
+                                                    && !ReferenceEquals(active, unsub)
+                                                    && !active.IsRetired
+                                                    && active.TryRemoveEndpoint(ep))
+                                                {
+                                                    try
+                                                    {
+                                                        active.EnsureSubscribedToServer(
+                                                            unsubMuxer.DefaultSubscriber,
+                                                            unsubChannelMessage.Channel,
+                                                            CommandFlags.FireAndForget,
+                                                            internalCall: true);
+                                                    }
+                                                    catch (Exception ex)
+                                                    {
+                                                        unsubMuxer.OnInternalError(ex);
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         break;
                                 }
                             }

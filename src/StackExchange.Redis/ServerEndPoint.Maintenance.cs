@@ -877,6 +877,7 @@ internal sealed partial class ServerEndPoint
             // subscription is now stale); attached nowhere is the stranded case. Both need acting on, and
             // distinguishing them from "already handled" is the whole job of this check.
             var subscription = pair.Value;
+            if (subscription.IsRetired) continue;
             var current = subscription.GetAnyCurrentServer();
             if (current is not null && !ReferenceEquals(current, this))
             {
